@@ -496,6 +496,7 @@ class WanAttentionBlock(nnx.Module):
       precision: jax.lax.Precision = None,
   ):
     self.dim = dim
+    self.mesh = mesh
 
     self.norm = WanRMS_norm(rngs=rngs, dim=dim, channel_first=False, dtype=dtype, weights_dtype=weights_dtype)
     self.to_qkv = nnx.Conv(
@@ -535,7 +536,36 @@ class WanAttentionBlock(nnx.Module):
     k = jnp.transpose(k, (0, 1, 3, 2))
     v = jnp.transpose(v, (0, 1, 3, 2))
 
-    x = jax.nn.dot_product_attention(q, k, v)
+    def _sdpa(q_local, k_full, v_full):
+      import math
+      dt = jnp.promote_types(jnp.promote_types(q_local.dtype, k_full.dtype), v_full.dtype)
+      qt, kt, vt = (jnp.transpose(t, (0, 2, 1, 3)).astype(dt) for t in (q_local, k_full, v_full))
+      out = jax.nn.dot_product_attention(
+          qt, kt, vt, implementation="xla", scale=1.0 / math.sqrt(int(q_local.shape[-1]))
+      )
+      return jnp.transpose(out, (0, 2, 1, 3)).astype(q_local.dtype)
+
+    axis = "vae_spatial"
+    if self.mesh is not None and axis in self.mesh.axis_names:
+      seq_spec = P(None, None, axis, None)
+      
+      q = jax.lax.with_sharding_constraint(q, seq_spec)
+      k = jax.lax.with_sharding_constraint(k, seq_spec)
+      v = jax.lax.with_sharding_constraint(v, seq_spec)
+
+      def body(q_local, k_local, v_local):
+        k_full = jax.lax.all_gather(k_local, axis, axis=2, tiled=True)
+        v_full = jax.lax.all_gather(v_local, axis, axis=2, tiled=True)
+        out_local = _sdpa(q_local, k_full, v_full)
+        return jax.lax.all_gather(out_local, axis, axis=2, tiled=True)
+
+      x = jax.shard_map(
+          body, mesh=self.mesh, in_specs=(seq_spec, seq_spec, seq_spec),
+          out_specs=P(), check_vma=False,
+      )(q, k, v)
+    else:
+      x = _sdpa(q, k, v)
+      
     x = jnp.squeeze(x, 1).reshape(batch_size * time, height, width, channels)
 
     # output projection
