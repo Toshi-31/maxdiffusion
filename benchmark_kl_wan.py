@@ -19,13 +19,16 @@ def run_benchmark():
     spatial_sharding = NamedSharding(mesh, P(None, None, None, "vae_spatial", None))
     dummy_z = jax.device_put(dummy_z, spatial_sharding)
 
-    block_sizes_q = [128, 256, 512, 1024]
-    block_sizes_k = [128, 256, 512, 1024]
+    # Targeted list of untested (bq, bk) combinations
+    block_sizes = [
+        (128, 1024), (256, 1024), (512, 1024),
+        (1024, 128), (1024, 256), (1024, 512), (1024, 1024),
+        (2048, 128), (2048, 256), (2048, 512), (2048, 1024), (2048, 2048)
+    ]
     
     with jax.set_mesh(mesh):
-        for bq in block_sizes_q:
-            for bk in block_sizes_k:
-                print(f"--- Testing block_q={bq}, block_k={bk} ---")
+        for bq, bk in block_sizes:
+            print(f"--- Testing block_q={bq}, block_k={bk} ---")
                 
                 vae = AutoencoderKLWan(rngs=rngs, mesh=mesh, dtype=jnp.bfloat16, flash_block_q=bq, flash_block_k=bk)
                 cache = AutoencoderKLWanCache(vae)
