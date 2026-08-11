@@ -536,50 +536,46 @@ class WanAttentionBlock(nnx.Module):
     k = jnp.transpose(k, (0, 1, 3, 2))
     v = jnp.transpose(v, (0, 1, 3, 2))
 
-    def _sdpa(q_local, k_full, v_full):
-      import math
-      from maxdiffusion.models.attention_flax import _tpu_flash_attention
-      dt = jnp.promote_types(jnp.promote_types(q_local.dtype, k_full.dtype), v_full.dtype)
-      qt, kt, vt = (jnp.transpose(t, (0, 2, 1, 3)).astype(dt) for t in (q_local, k_full, v_full))
-      
-      # Scale K to match dot_product_attention behavior
-      scale = 1.0 / math.sqrt(int(q_local.shape[-1]))
-      kt = kt * scale
-      
-      out = _tpu_flash_attention(
-          query=qt,
-          key=kt,
-          value=vt,
-          heads=1,
-          mesh=self.mesh,
-          axis_names_q=(None, None, None, None),
-          axis_names_kv=(None, None, None, None),
-          flash_block_sizes=None,
-          attention_kernel="flash"
-      )
-      
-      return jnp.transpose(out, (0, 2, 1, 3)).astype(q_local.dtype)
-
     axis = "vae_spatial"
     if self.mesh is not None and axis in self.mesh.axis_names:
-      seq_spec = P(None, None, axis, None)
+      seq_spec_q = P(None, None, axis, None)
+      seq_spec_kv = P(None, None, None, None)
       
-      q = jax.lax.with_sharding_constraint(q, seq_spec)
-      k = jax.lax.with_sharding_constraint(k, seq_spec)
-      v = jax.lax.with_sharding_constraint(v, seq_spec)
-
-      def body(q_local, k_local, v_local):
-        k_full = jax.lax.all_gather(k_local, axis, axis=2, tiled=True)
-        v_full = jax.lax.all_gather(v_local, axis, axis=2, tiled=True)
-        out_local = _sdpa(q_local, k_full, v_full)
-        return jax.lax.all_gather(out_local, axis, axis=2, tiled=True)
-
-      x = jax.shard_map(
-          body, mesh=self.mesh, in_specs=(seq_spec, seq_spec, seq_spec),
-          out_specs=P(), check_vma=False,
-      )(q, k, v)
+      q = jax.lax.with_sharding_constraint(q, seq_spec_q)
+      # Force compiler to all-gather K and V if they were sharded
+      k = jax.lax.with_sharding_constraint(k, seq_spec_kv)
+      v = jax.lax.with_sharding_constraint(v, seq_spec_kv)
+      
+      axis_names_q = (None, None, axis, None)
+      axis_names_kv = (None, None, None, None)
     else:
-      x = _sdpa(q, k, v)
+      axis_names_q = (None, None, None, None)
+      axis_names_kv = (None, None, None, None)
+
+    import math
+    from maxdiffusion.models.attention_flax import _tpu_flash_attention
+    dt = jnp.promote_types(jnp.promote_types(q.dtype, k.dtype), v.dtype)
+    q, k, v = q.astype(dt), k.astype(dt), v.astype(dt)
+    
+    # Scale K for flash attention
+    scale = 1.0 / math.sqrt(int(q.shape[-1]))
+    k = k * scale
+    
+    x = _tpu_flash_attention(
+        query=q,
+        key=k,
+        value=v,
+        heads=1,
+        mesh=self.mesh,
+        axis_names_q=axis_names_q,
+        axis_names_kv=axis_names_kv,
+        flash_block_sizes=None,
+        attention_kernel="flash"
+    )
+    
+    if self.mesh is not None and axis in self.mesh.axis_names:
+      # Explicitly shard the output back to vae_spatial
+      x = jax.lax.with_sharding_constraint(x, P(None, None, axis, None))
       
     x = jnp.squeeze(x, 1).reshape(batch_size * time, height, width, channels)
 
