@@ -19,8 +19,8 @@ def run_benchmark():
     spatial_sharding = NamedSharding(mesh, P(None, None, None, "vae_spatial", None))
     dummy_z = jax.device_put(dummy_z, spatial_sharding)
 
-    block_sizes_q = [128, 256, 512]
-    block_sizes_k = [128, 256, 512]
+    block_sizes_q = [128, 256, 512, 1024]
+    block_sizes_k = [128, 256, 512, 1024]
     
     with jax.set_mesh(mesh):
         for bq in block_sizes_q:
