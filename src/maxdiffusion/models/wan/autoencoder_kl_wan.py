@@ -538,11 +538,26 @@ class WanAttentionBlock(nnx.Module):
 
     def _sdpa(q_local, k_full, v_full):
       import math
+      from maxdiffusion.models.attention_flax import _tpu_flash_attention
       dt = jnp.promote_types(jnp.promote_types(q_local.dtype, k_full.dtype), v_full.dtype)
       qt, kt, vt = (jnp.transpose(t, (0, 2, 1, 3)).astype(dt) for t in (q_local, k_full, v_full))
-      out = jax.nn.dot_product_attention(
-          qt, kt, vt, implementation="xla", scale=1.0 / math.sqrt(int(q_local.shape[-1]))
+      
+      # Scale K to match dot_product_attention behavior
+      scale = 1.0 / math.sqrt(int(q_local.shape[-1]))
+      kt = kt * scale
+      
+      out = _tpu_flash_attention(
+          query=qt,
+          key=kt,
+          value=vt,
+          heads=1,
+          mesh=self.mesh,
+          axis_names_q=(None, None, None, None),
+          axis_names_kv=(None, None, None, None),
+          flash_block_sizes=None,
+          attention_kernel="flash"
       )
+      
       return jnp.transpose(out, (0, 2, 1, 3)).astype(q_local.dtype)
 
     axis = "vae_spatial"
