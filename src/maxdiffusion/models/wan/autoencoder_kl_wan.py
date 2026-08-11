@@ -494,8 +494,12 @@ class WanAttentionBlock(nnx.Module):
       dtype: jnp.dtype = jnp.float32,
       weights_dtype: jnp.dtype = jnp.float32,
       precision: jax.lax.Precision = None,
+      flash_block_q: int = 128,
+      flash_block_k: int = 128,
   ):
     self.dim = dim
+    self.flash_block_q = flash_block_q
+    self.flash_block_k = flash_block_k
     self.mesh = mesh
 
     self.norm = WanRMS_norm(rngs=rngs, dim=dim, channel_first=False, dtype=dtype, weights_dtype=weights_dtype)
@@ -561,6 +565,12 @@ class WanAttentionBlock(nnx.Module):
     scale = 1.0 / math.sqrt(int(q.shape[-1]))
     k = k * scale
     
+    from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_kernel
+    flash_block_sizes = splash_attention_kernel.BlockSizes(
+        block_q=self.flash_block_q,
+        block_k=self.flash_block_k
+    )
+    
     x = _tpu_flash_attention(
         query=q,
         key=k,
@@ -569,7 +579,7 @@ class WanAttentionBlock(nnx.Module):
         mesh=self.mesh,
         axis_names_q=axis_names_q,
         axis_names_kv=axis_names_kv,
-        flash_block_sizes=None,
+        flash_block_sizes=flash_block_sizes,
         attention_kernel="flash"
     )
     
@@ -601,6 +611,8 @@ class WanMidBlock(nnx.Module):
       dtype: jnp.dtype = jnp.float32,
       weights_dtype: jnp.dtype = jnp.float32,
       precision: jax.lax.Precision = None,
+      flash_block_q: int = 128,
+      flash_block_k: int = 128,
   ):
     self.dim = dim
     resnets = [
@@ -619,7 +631,7 @@ class WanMidBlock(nnx.Module):
     attentions = []
     for _ in range(num_layers):
       attentions.append(
-          WanAttentionBlock(dim=dim, rngs=rngs, mesh=mesh, dtype=dtype, weights_dtype=weights_dtype, precision=precision)
+          WanAttentionBlock(dim=dim, rngs=rngs, mesh=mesh, dtype=dtype, weights_dtype=weights_dtype, precision=precision, flash_block_q=flash_block_q, flash_block_k=flash_block_k)
       )
       resnets.append(
           WanResidualBlock(
@@ -877,8 +889,12 @@ class WanDecoder3d(nnx.Module):
       dtype: jnp.dtype = jnp.float32,
       weights_dtype: jnp.dtype = jnp.float32,
       precision: jax.lax.Precision = None,
+      flash_block_q: int = 128,
+      flash_block_k: int = 128,
   ):
     self.dim = dim
+    self.flash_block_q = flash_block_q
+    self.flash_block_k = flash_block_k
     self.z_dim = z_dim
     self.dim_mult = dim_mult
     self.num_res_blocks = num_res_blocks
@@ -915,6 +931,8 @@ class WanDecoder3d(nnx.Module):
         dtype=dtype,
         weights_dtype=weights_dtype,
         precision=precision,
+        flash_block_q=flash_block_q,
+        flash_block_k=flash_block_k,
     )
 
     # upsample blocks
@@ -1103,6 +1121,8 @@ class AutoencoderKLWan(nnx.Module, FlaxModelMixin, ConfigMixin):
       precision: jax.lax.Precision = None,
       vae_decode_chunk: int = 1,
       vae_encode_chunk: int = 4,
+      flash_block_q: int = 128,
+      flash_block_k: int = 128,
   ):
     self.z_dim = z_dim
     assert vae_decode_chunk >= 1 or vae_decode_chunk == -1, f"vae_decode_chunk must be >= 1 or -1, got {vae_decode_chunk}"
@@ -1170,6 +1190,8 @@ class AutoencoderKLWan(nnx.Module, FlaxModelMixin, ConfigMixin):
         dtype=dtype,
         weights_dtype=weights_dtype,
         precision=precision,
+        flash_block_q=flash_block_q,
+        flash_block_k=flash_block_k,
     )
     self.mesh = mesh
 
