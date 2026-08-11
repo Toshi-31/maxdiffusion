@@ -575,9 +575,10 @@ class WanAttentionBlock(nnx.Module):
     
     if self.mesh is not None and axis in self.mesh.axis_names:
       # Explicitly shard the output back to vae_spatial
-      x = jax.lax.with_sharding_constraint(x, P(None, None, axis, None))
+      # _tpu_flash_attention returns (batch, seq, dim), so we use rank-3 spec
+      x = jax.lax.with_sharding_constraint(x, P(None, axis, None))
       
-    x = jnp.squeeze(x, 1).reshape(batch_size * time, height, width, channels)
+    x = x.reshape(batch_size * time, height, width, channels)
 
     # output projection
     x = self.proj(x)
