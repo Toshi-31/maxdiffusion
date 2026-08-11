@@ -565,8 +565,8 @@ class WanAttentionBlock(nnx.Module):
     scale = 1.0 / math.sqrt(int(q.shape[-1]))
     k = k * scale
     
-    from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_kernel
-    flash_block_sizes = splash_attention_kernel.BlockSizes(
+    import types
+    flash_block_sizes = types.SimpleNamespace(
         block_q=self.flash_block_q,
         block_kv=self.flash_block_k
     )
