@@ -568,7 +568,7 @@ class WanAttentionBlock(nnx.Module):
     from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_kernel
     flash_block_sizes = splash_attention_kernel.BlockSizes(
         block_q=self.flash_block_q,
-        block_k=self.flash_block_k
+        block_kv=self.flash_block_k
     )
     
     x = _tpu_flash_attention(
