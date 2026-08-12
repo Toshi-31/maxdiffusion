@@ -567,8 +567,8 @@ class WanAttentionBlock(nnx.Module):
     
     import types
     flash_block_sizes = types.SimpleNamespace(
-        block_q=self.flash_block_q,
-        block_kv=self.flash_block_k
+        block_q=1024,
+        block_kv=1024
     )
     
     x = _tpu_flash_attention(
@@ -580,7 +580,7 @@ class WanAttentionBlock(nnx.Module):
         axis_names_q=axis_names_q,
         axis_names_kv=axis_names_kv,
         flash_block_sizes=flash_block_sizes,
-        attention_kernel="flash"
+        attention_kernel="tokamax_flash"
     )
     
     if self.mesh is not None and axis in self.mesh.axis_names:
