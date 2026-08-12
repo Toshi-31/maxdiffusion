@@ -7,17 +7,14 @@ from maxdiffusion.models.wan.autoencoder_kl_wan import AutoencoderKLWan, Autoenc
 import numpy as np
 
 def run_online_profiler():
-    # Start the JAX profiling server on port 9999
     jax.profiler.start_server(9999)
     print("🚀 JAX Profiler Server started on port 9999!")
-    print("You can now connect to it via the internal Xprof UI.")
 
     devices = jax.devices()
     device_array = np.array(devices[:4]).reshape((1, 4))
     mesh = Mesh(device_array, ('redundant', 'vae_spatial'))
 
     rngs = nnx.Rngs(0)
-    
     batch, time_dim, height, width, z_dim = 1, 1, 135, 240, 16 
     dummy_z = jnp.ones((batch, time_dim, height, width, z_dim), dtype=jnp.bfloat16)
     
@@ -26,7 +23,6 @@ def run_online_profiler():
 
     with jax.set_mesh(mesh):
         print(f"--- Running Infinite Loop for Online Profiling ---")
-        
         vae = AutoencoderKLWan(rngs=rngs, mesh=mesh, dtype=jnp.bfloat16)
         cache = AutoencoderKLWanCache(vae)
         
@@ -37,14 +33,17 @@ def run_online_profiler():
         out = decode_step(dummy_z, cache)
         jax.block_until_ready(out)
 
-        print("Entering execution loop. Go to Xprof UI and capture the profile!")
+        print("Entering execution loop. Go capture the profile!")
         step_count = 0
         while True:
+            start_time = time.perf_counter()
             out = decode_step(dummy_z, cache)
             jax.block_until_ready(out)
+            end_time = time.perf_counter()
+            
             step_count += 1
             if step_count % 10 == 0:
-                print(f"Ran {step_count} steps...")
+                print(f"Ran {step_count} steps... Last step took: {(end_time - start_time) * 1000:.2f} ms")
 
 if __name__ == "__main__":
     run_online_profiler()
