@@ -571,10 +571,11 @@ class WanAttentionBlock(nnx.Module):
     scale = 1.0 / math.sqrt(int(q.shape[-1]))
     k = k * scale
     
-    import types
+    import os, types
     flash_block_sizes = types.SimpleNamespace(
-        block_q=1024,
-        block_kv=1024
+        block_q=int(os.environ.get("BLOCK_Q", "1024")),
+        block_kv=int(os.environ.get("BLOCK_KV", "1024")),
+        block_kv_compute=int(os.environ.get("BLOCK_KV_COMPUTE", "1024"))
     )
     
     x = _tpu_flash_attention(
