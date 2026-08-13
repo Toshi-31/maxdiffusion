@@ -532,7 +532,13 @@ class WanAttentionBlock(nnx.Module):
     x = x.reshape(batch_size * time, height, width, channels)
     x = self.norm(x)
 
-    qkv = self.to_qkv(x)  # Output: (N*T, H, W, C * 3)
+    x_flat = x.reshape(batch_size * time, height * width, 1, channels)
+    # Pad sequence from 32400 to 32768
+    pad_len = 32768 - (height * width)
+    if pad_len > 0:
+      x_flat = jnp.pad(x_flat, ((0, 0), (0, pad_len), (0, 0), (0, 0)))
+      
+    qkv = self.to_qkv(x_flat)  # Output: (N*T, 32768, 1, C * 3)
     qkv = qkv.reshape(batch_size * time, 1, -1, channels * 3)
     qkv = jnp.transpose(qkv, (0, 1, 3, 2))
     q, k, v = jnp.split(qkv, 3, axis=-2)
@@ -587,6 +593,9 @@ class WanAttentionBlock(nnx.Module):
       # Explicitly shard the output back to vae_spatial
       # _tpu_flash_attention returns (batch, seq, dim), so we use rank-3 spec
       x = jax.lax.with_sharding_constraint(x, P(None, axis, None))
+      
+    if pad_len > 0:
+      x = x[:, :height * width, :]
       
     x = x.reshape(batch_size * time, height, width, channels)
 
