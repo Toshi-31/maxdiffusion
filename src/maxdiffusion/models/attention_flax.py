@@ -628,7 +628,7 @@ def _tpu_flash_attention(
           use_base2_exp=use_base2_exp,
           use_experimental_scheduler=use_experimental_scheduler,
           vmem_limit_bytes=vmem_limit_bytes,
-          ring_axis="context",
+          ring_axis=ring_axis,
       )
       vmapped_ring = jax.vmap(ring_kernel, in_axes=(0, 0, 0))
       attention_output = vmapped_ring(query_local, key_local, value_local)
