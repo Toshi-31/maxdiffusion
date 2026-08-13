@@ -580,7 +580,7 @@ class WanAttentionBlock(nnx.Module):
         axis_names_q=axis_names_q,
         axis_names_kv=axis_names_kv,
         flash_block_sizes=flash_block_sizes,
-        attention_kernel="tokamax_flash"
+        attention_kernel="tokamax_ring"
     )
     
     if self.mesh is not None and axis in self.mesh.axis_names:
