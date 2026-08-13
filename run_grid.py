@@ -9,7 +9,7 @@ blocks_kvc = [256, 512, 1024]
 
 results = []
 
-report_file = "/Users/toshipahadia/maxdiffusion/workloads/reports/optimization_report_v1.md"
+report_file = "workloads/reports/optimization_report_v1.md"
 os.makedirs(os.path.dirname(report_file), exist_ok=True)
 
 with open(report_file, "w") as f:
@@ -41,7 +41,7 @@ for bq in blocks_q:
                 process = subprocess.run(
                     ["python3", "benchmark_kl_wan.py"], 
                     env=env, 
-                    cwd="/Users/toshipahadia/maxdiffusion",
+                    cwd=None,
                     capture_output=True, 
                     text=True, 
                     timeout=300
