@@ -582,7 +582,8 @@ def _tpu_flash_attention(
 ) -> jax.Array:
   """TPU Flash Attention"""
 
-  num_context_shards = mesh.shape[CONTEXT] if CONTEXT in mesh.shape else 1
+  ring_axis = axis_names_q[0]
+  num_context_shards = mesh.shape[ring_axis] if ring_axis in mesh.shape else 1
   query, orig_q_seq_len = _reshape_data_for_flash(query, heads, num_context_shards)
   key, _ = _reshape_data_for_flash(key, heads, num_context_shards)
   value, _ = _reshape_data_for_flash(value, heads, num_context_shards)
@@ -702,7 +703,7 @@ def _tpu_flash_attention(
               use_experimental_scheduler=use_experimental_scheduler,
           ),
           save_residuals=False,
-          ring_axis=CONTEXT,
+          ring_axis=ring_axis,
           # Padding-only IDs are identical on each shard. Explicit masks differ
           # by KV shard and must rotate together with K/V.
           rotate_segment_ids=attention_mask is not None,
@@ -733,13 +734,13 @@ def _tpu_flash_attention(
 
         perm = [(j, (j + 1) % num_context_shards) for j in range(num_context_shards)]
 
-        k1 = jax.lax.ppermute(key, axis_name=CONTEXT, perm=perm)
-        v1 = jax.lax.ppermute(value, axis_name=CONTEXT, perm=perm)
+        k1 = jax.lax.ppermute(key, axis_name=ring_axis, perm=perm)
+        v1 = jax.lax.ppermute(value, axis_name=ring_axis, perm=perm)
 
         def ring_scan_body(carry, _):
           m, l, o, k_current, v_current = carry
-          k_next = jax.lax.ppermute(k_current, axis_name=CONTEXT, perm=perm)
-          v_next = jax.lax.ppermute(v_current, axis_name=CONTEXT, perm=perm)
+          k_next = jax.lax.ppermute(k_current, axis_name=ring_axis, perm=perm)
+          v_next = jax.lax.ppermute(v_current, axis_name=ring_axis, perm=perm)
 
           out_chunk, (lse_chunk,) = vmapped_splash(query, k_current, v_current, segment_ids)
 
