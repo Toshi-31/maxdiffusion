@@ -582,7 +582,7 @@ def _tpu_flash_attention(
 ) -> jax.Array:
   """TPU Flash Attention"""
 
-  ring_axis = axis_names_q[0]
+  ring_axis = next((x for x in axis_names_q if isinstance(x, str)), "context")
   num_context_shards = mesh.shape[ring_axis] if ring_axis in mesh.shape else 1
   query, orig_q_seq_len = _reshape_data_for_flash(query, heads, num_context_shards)
   key, _ = _reshape_data_for_flash(key, heads, num_context_shards)
