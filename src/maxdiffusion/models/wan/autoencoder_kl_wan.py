@@ -196,13 +196,12 @@ class WanUpsample(nnx.Module):
     in_shape = x.shape
     assert len(in_shape) == 4, "This module only takes tensors with shape of 4."
     n, h, w, c = in_shape
-    target_h = int(h * self.scale_factor[0])
-    target_w = int(w * self.scale_factor[1])
-    if self.method == "nearest":
-      scale_h = int(self.scale_factor[0])
-      scale_w = int(self.scale_factor[1])
-      out = jnp.repeat(jnp.repeat(x, scale_h, axis=1), scale_w, axis=2)
+    if self.method == "nearest" and int(self.scale_factor[0]) == 2 and int(self.scale_factor[1]) == 2:
+      out = jnp.broadcast_to(x[:, :, None, :, None, :], (n, h, 2, w, 2, c))
+      out = out.reshape((n, h * 2, w * 2, c))
     else:
+      target_h = int(h * self.scale_factor[0])
+      target_w = int(w * self.scale_factor[1])
       out = jax.image.resize(x.astype(jnp.float32), (n, target_h, target_w, c), method=self.method)
       out = out.astype(input_dtype)
     return out
