@@ -27,11 +27,11 @@ def run_benchmark():
         cache = AutoencoderKLWanCache(vae)
         
         @nnx.jit
-        def decode_step(z, feat_cache):
+        def decode_step(vae, z, feat_cache):
             return vae.decode(z, feat_cache)
 
         print("JIT Compiling...")
-        out = decode_step(dummy_z, cache)
+        out = decode_step(vae, dummy_z, cache)
         jax.block_until_ready(out)
 
         print("Running Benchmark...")
@@ -41,7 +41,7 @@ def run_benchmark():
         
         iters = 5
         for _ in range(iters):
-            out = decode_step(dummy_z, cache)
+            out = decode_step(vae, dummy_z, cache)
         jax.block_until_ready(out)
         
         end = time.perf_counter()
