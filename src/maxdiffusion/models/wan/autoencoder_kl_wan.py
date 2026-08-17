@@ -536,49 +536,8 @@ class WanAttentionBlock(nnx.Module):
     k = jnp.transpose(k, (0, 1, 3, 2))
     v = jnp.transpose(v, (0, 1, 3, 2))
 
-    axis = "vae_spatial"
-    if self.mesh is not None and axis in self.mesh.axis_names:
-      seq_spec_q = P(None, None, axis, None)
-      seq_spec_kv = P(None, None, None, None)
-      
-      q = jax.lax.with_sharding_constraint(q, seq_spec_q)
-      # Force compiler to all-gather K and V if they were sharded
-      k = jax.lax.with_sharding_constraint(k, seq_spec_kv)
-      v = jax.lax.with_sharding_constraint(v, seq_spec_kv)
-      
-      axis_names_q = (None, None, axis, None)
-      axis_names_kv = (None, None, None, None)
-    else:
-      axis_names_q = (None, None, None, None)
-      axis_names_kv = (None, None, None, None)
-
-    import math
-    from maxdiffusion.models.attention_flax import _tpu_flash_attention
-    dt = jnp.promote_types(jnp.promote_types(q.dtype, k.dtype), v.dtype)
-    q, k, v = q.astype(dt), k.astype(dt), v.astype(dt)
-    
-    # Scale K for flash attention
-    scale = 1.0 / math.sqrt(int(q.shape[-1]))
-    k = k * scale
-    
-    x = _tpu_flash_attention(
-        query=q,
-        key=k,
-        value=v,
-        heads=1,
-        mesh=self.mesh,
-        axis_names_q=axis_names_q,
-        axis_names_kv=axis_names_kv,
-        flash_block_sizes=None,
-        attention_kernel="flash"
-    )
-    
-    if self.mesh is not None and axis in self.mesh.axis_names:
-      # Explicitly shard the output back to vae_spatial
-      # _tpu_flash_attention returns (batch, seq, dim), so we use rank-3 spec
-      x = jax.lax.with_sharding_constraint(x, P(None, axis, None))
-      
-    x = x.reshape(batch_size * time, height, width, channels)
+    x = jax.nn.dot_product_attention(q, k, v)
+    x = jnp.squeeze(x, 1).reshape(batch_size * time, height, width, channels)
 
     # output projection
     x = self.proj(x)
