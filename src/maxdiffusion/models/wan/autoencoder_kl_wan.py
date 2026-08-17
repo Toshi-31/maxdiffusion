@@ -68,7 +68,7 @@ tree_util.register_pytree_node(RepSentinel, lambda x: ((), None), lambda _, __: 
 
 
 def _with_sharding_constraint(x, sharding):
-  if sharding is not None and hasattr(x, 'shape'):
+  if sharding is not None and isinstance(x, jax.Array):
     if hasattr(sharding, "mesh") and hasattr(sharding, "spec") and sharding.mesh is not None:
       mesh = sharding.mesh
       spec = sharding.spec
@@ -1241,7 +1241,7 @@ class AutoencoderKLWan(nnx.Module, FlaxModelMixin, ConfigMixin):
       out_chunk, next_feat_map, _ = local_encoder(chunk, feat_cache=current_feat_map, feat_idx=0)
       out_chunk = _with_sharding_constraint(out_chunk, spatial_sharding)
       next_feat_map = jax.tree_util.tree_map(
-          lambda x: _with_sharding_constraint(x, spatial_sharding) if hasattr(x, 'shape') else x, next_feat_map
+          lambda x: _with_sharding_constraint(x, spatial_sharding) if isinstance(x, jax.Array) else x, next_feat_map
       )
       return next_feat_map, out_chunk
 
@@ -1333,7 +1333,7 @@ class AutoencoderKLWan(nnx.Module, FlaxModelMixin, ConfigMixin):
           out_chunk, next_feat_map, _ = local_decoder(chunk_in, feat_cache=current_feat_map, feat_idx=0)
           out_chunk = _with_sharding_constraint(out_chunk, spatial_sharding)
           next_feat_map = jax.tree_util.tree_map(
-              lambda x: _with_sharding_constraint(x, spatial_sharding) if hasattr(x, 'shape') else x,
+              lambda x: _with_sharding_constraint(x, spatial_sharding) if isinstance(x, jax.Array) else x,
               next_feat_map,
           )
           return next_feat_map, out_chunk
