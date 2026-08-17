@@ -496,7 +496,6 @@ class WanAttentionBlock(nnx.Module):
       precision: jax.lax.Precision = None,
   ):
     self.dim = dim
-    self.mesh = mesh
 
     self.norm = WanRMS_norm(rngs=rngs, dim=dim, channel_first=False, dtype=dtype, weights_dtype=weights_dtype)
     self.to_qkv = nnx.Conv(

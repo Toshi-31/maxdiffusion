@@ -21,9 +21,9 @@ def run_benchmark():
     dummy_z = jax.device_put(dummy_z, spatial_sharding)
 
     with jax.set_mesh(mesh):
-        print(f"--- Testing Tokamax Flash 1024x1024 (8 chips, chunk=5, T=20) ---")
+        print(f"--- Testing Tokamax Flash 1024x1024 (8 chips, chunk=-1 (No Chunking), T=20) ---")
         
-        vae = AutoencoderKLWan(rngs=rngs, mesh=mesh, vae_decode_chunk=5, dtype=jnp.bfloat16)
+        vae = AutoencoderKLWan(rngs=rngs, mesh=mesh, vae_decode_chunk=-1, dtype=jnp.bfloat16)
         cache = AutoencoderKLWanCache(vae)
         
         @nnx.jit
