@@ -8,8 +8,8 @@ import numpy as np
 
 def run_benchmark():
     devices = jax.devices()
-    device_array = np.array(devices[:8]).reshape((1, 8))
-    mesh = Mesh(device_array, ('redundant', 'vae_spatial'))
+    device_array = np.array(devices[:8]).reshape((1, 8, 1))
+    mesh = Mesh(device_array, ('redundant', 'vae_spatial', 'context'))
 
     rngs = nnx.Rngs(0)
     
