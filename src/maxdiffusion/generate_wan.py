@@ -414,7 +414,16 @@ def run(config, pipeline=None, filename_prefix="", commit_hash=None):
     os.environ["XLA_FLAGS"] = f"{xla_flags} {new_flags}"
     max_logging.log(f"Injected XLA_FLAGS for profiling: {new_flags}")
 
+    profiler_gcs_path = config.get_keys().get("profiler_gcs_path", "")
+    if profiler_gcs_path:
+      jax.profiler.start_trace(profiler_gcs_path)
+      max_logging.log(f"Started JAX profiler trace, dumping to {profiler_gcs_path}")
+
     videos = call_pipeline(config, pipeline, prompt, negative_prompt)
+    
+    if profiler_gcs_path:
+      jax.profiler.stop_trace()
+      max_logging.log("Stopped JAX profiler trace.")
     if isinstance(videos, tuple):
       videos = videos[0]
     generation_time_with_profiler = time.perf_counter() - s0
