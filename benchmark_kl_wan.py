@@ -23,7 +23,7 @@ def run_benchmark():
     with jax.set_mesh(mesh):
         print(f"--- Testing Tokamax Flash 1024x1024 (8 chips, chunk=5, T=1) ---")
         
-        vae = AutoencoderKLWan(rngs=rngs, mesh=mesh, vae_decode_chunk=5, dtype=jnp.bfloat16)
+        vae = AutoencoderKLWan(rngs=rngs, mesh=mesh, dtype=jnp.bfloat16)
         cache = AutoencoderKLWanCache(vae)
         
         @nnx.jit
