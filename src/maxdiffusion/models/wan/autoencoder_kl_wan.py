@@ -1049,6 +1049,7 @@ class AutoencoderKLWan(nnx.Module, FlaxModelMixin, ConfigMixin):
     self.temporal_upsample = temperal_downsample[::-1]
     self.latents_mean = latents_mean
     self.latents_std = latents_std
+    self.mesh = mesh
 
     self.encoder = WanEncoder3d(
         rngs=rngs,

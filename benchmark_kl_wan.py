@@ -8,31 +8,28 @@ import numpy as np
 
 def run_benchmark():
     devices = jax.devices()
-    device_array = np.array(devices[:8]).reshape((1, 8, 1))
-    mesh = Mesh(device_array, ('redundant', 'vae_spatial', 'context'))
+    device_array = np.array(devices[:8]).reshape((1, 8))
+    mesh = Mesh(device_array, ('redundant', 'vae_spatial'))
 
     rngs = nnx.Rngs(0)
     
-    # Simulate single frame decode
-    batch, time_dim, height, width, z_dim = 1, 1, 135, 240, 16 
+    # Simulate full pipeline: 81 frames = 20 latents (after T/4 compression)
+    batch, time_dim, height, width, z_dim = 1, 20, 135, 240, 16 
     dummy_z = jnp.ones((batch, time_dim, height, width, z_dim), dtype=jnp.bfloat16)
     
     spatial_sharding = NamedSharding(mesh, P(None, None, None, "vae_spatial", None))
     dummy_z = jax.device_put(dummy_z, spatial_sharding)
 
     with jax.set_mesh(mesh):
-        print(f"--- Testing Tokamax Flash 1024x1024 (8 chips, chunk=5, T=1) ---")
+        print(f"--- Testing Tokamax Flash 1024x1024 (8 chips, chunk=5, T=20) ---")
         
-        vae = AutoencoderKLWan(rngs=rngs, mesh=mesh, dtype=jnp.bfloat16)
+        vae = AutoencoderKLWan(rngs=rngs, mesh=mesh, vae_decode_chunk=5, dtype=jnp.bfloat16)
         cache = AutoencoderKLWanCache(vae)
         
         @nnx.jit
         def decode_step(z, feat_cache):
             return vae.decode(z, feat_cache)
 
-        # Start profiler tracing early to capture compilation
-        trace_dir = "/mnt/data_1tb/outputs/benchmark_trace/"
-        jax.profiler.start_trace(trace_dir)
         print("JIT Compiling...")
         out = decode_step(dummy_z, cache)
         jax.block_until_ready(out)
@@ -46,10 +43,6 @@ def run_benchmark():
         jax.block_until_ready(out)
         
         end = time.perf_counter()
-        
-        # Stop profiler
-        jax.profiler.stop_trace()
-        print(f"Saved xprof trace to {trace_dir}")
         
         print(f"Average VAE Decode Time [Tokamax 1024x1024]: {(end - start) / iters * 1000:.2f} ms\n")
 
