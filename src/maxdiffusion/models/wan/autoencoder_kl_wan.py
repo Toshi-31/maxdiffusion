@@ -193,10 +193,8 @@ class WanUpsample(nnx.Module):
     in_shape = x.shape
     assert len(in_shape) == 4, "This module only takes tensors with shape of 4."
     n, h, w, c = in_shape
-    target_h = int(h * self.scale_factor[0])
-    target_w = int(w * self.scale_factor[1])
-    out = jax.image.resize(x.astype(jnp.float32), (n, target_h, target_w, c), method=self.method)
-    return out.astype(input_dtype)
+    out = jnp.repeat(jnp.repeat(x, int(self.scale_factor[0]), axis=1), int(self.scale_factor[1]), axis=2)
+    return out
 
 
 class Identity(nnx.Module):
