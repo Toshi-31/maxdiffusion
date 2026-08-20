@@ -348,8 +348,8 @@ class WanVaeTest(unittest.TestCase):
     in_dim = out_dim = 96
     batch = 1
     t = 1
-    height = 480
-    width = 720
+    height = 512
+    width = 768
     dim = 96
     input_shape = (batch, t, height, width, dim)
     expected_output_shape = (batch, t, height, width, dim)
@@ -374,8 +374,8 @@ class WanVaeTest(unittest.TestCase):
     dim = 384
     batch = 1
     t = 1
-    height = 60
-    width = 90
+    height = 64
+    width = 128
     input_shape = (batch, t, height, width, dim)
     with self.mesh, nn_partitioning.axis_rules(self.config.vae_logical_axis_rules):
       wan_attention = WanAttentionBlock(dim=dim, rngs=rngs)
@@ -403,8 +403,8 @@ class WanVaeTest(unittest.TestCase):
     batch = 1
     t = 1
     dim = 384
-    height = 60
-    width = 96
+    height = 64
+    width = 128
     input_shape = (batch, t, height, width, dim)
     with mesh, nn_partitioning.axis_rules(config.vae_logical_axis_rules):
       wan_midblock = WanMidBlock(dim=dim, rngs=rngs, mesh=mesh)
@@ -450,8 +450,8 @@ class WanVaeTest(unittest.TestCase):
       batch = 1
       t = 13
       channels = 16
-      height = 60
-      width = 96
+      height = 64
+      width = 128
       input_shape = (batch, t, height, width, channels)
       input = jnp.ones(input_shape)
 
@@ -459,7 +459,7 @@ class WanVaeTest(unittest.TestCase):
       latents_std = 1.0 / jnp.array(wan_vae.latents_std).reshape(1, 1, 1, 1, wan_vae.z_dim)
       input = input / latents_std + latents_mean
       dummy_output = wan_vae.decode(input, feat_cache=vae_cache)
-      assert dummy_output.sample.shape == (batch, 49, 480, 768, 3)
+      assert dummy_output.sample.shape == (batch, 49, 512, 1024, 3)
 
   def test_wan_encode(self):
     key = jax.random.key(0)
@@ -499,12 +499,12 @@ class WanVaeTest(unittest.TestCase):
       batch = 1
       channels = 3
       t = 49
-      height = 480
-      width = 720
+      height = 512
+      width = 1024
       input_shape = (batch, channels, t, height, width)
       input = jnp.ones(input_shape)
       output = wan_vae.encode(input, feat_cache=vae_cache)
-      assert output.latent_dist.sample(key).shape == (1, 13, 60, 90, 16)
+      assert output.latent_dist.sample(key).shape == (1, 13, 64, 128, 16)
 
   def test_load_checkpoint(self):
     def vae_encode(video, wan_vae, vae_cache, key):
@@ -537,6 +537,10 @@ class WanVaeTest(unittest.TestCase):
     vae_scale_factor_spatial = 2 ** len(wan_vae.temperal_downsample)
     video_processor = VideoProcessor(vae_scale_factor=vae_scale_factor_spatial)
     width, height = video[0].size
+    # Ensure dimensions are cleanly divisible by the dynamic spatial sharding multiple
+    spatial_multiple = vae_scale_factor_spatial * vae_spatial
+    width = (width // spatial_multiple) * spatial_multiple
+    height = (height // spatial_multiple) * spatial_multiple
     video = video_processor.preprocess_video(video, height=height, width=width)  # .to(dtype=jnp.float32)
     original_video = jnp.array(np.array(video), dtype=jnp.bfloat16)
 
