@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import os
+import sys
 import subprocess
 import gc
 import numpy as np
@@ -22,10 +23,9 @@ import torch
 from PIL import Image
 from skimage.metrics import structural_similarity as ssim
 
-# Set HF_HOME cache path early
+# Ensure default HF_HOME is defined if not set by environment
 if not os.environ.get("HF_HOME"):
-  if os.path.exists("/mnt/data/hf_cache"):
-    os.environ["HF_HOME"] = "/mnt/data/hf_cache"
+  os.environ["HF_HOME"] = os.path.expanduser("~/.cache/huggingface")
 
 
 def compute_psnr(img1, img2):
@@ -43,13 +43,34 @@ def compute_ssim(img1, img2):
   return ssim(img1_gray, img2_gray)
 
 
+def get_model_snapshot_dir(model_id: str) -> str:
+  """Locates the snapshot directory for the given model_id strictly under HF_HOME."""
+  try:
+    from huggingface_hub import snapshot_download
+
+    return snapshot_download(repo_id=model_id, local_files_only=True)
+  except Exception:
+    pass
+
+  hf_home = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
+  escaped_id = model_id.replace("/", "--")
+  cache_dir = os.path.join(hf_home, "hub", f"models--{escaped_id}", "snapshots")
+  if not os.path.exists(cache_dir):
+    cache_dir = os.path.join(hf_home, f"models--{escaped_id}", "snapshots")
+
+  if not os.path.exists(cache_dir):
+    raise FileNotFoundError(f"Hugging Face cache directory not found for '{model_id}' under HF_HOME ({hf_home}).")
+
+  snapshots = [s for s in os.listdir(cache_dir) if not s.startswith(".")]
+  if not snapshots:
+    raise FileNotFoundError(f"No snapshot directory found for '{model_id}' in {cache_dir}.")
+
+  return os.path.join(cache_dir, snapshots[0])
+
+
 def run_pytorch_pipeline(model_id, prompt, batch_size, width, height, num_inference_steps, seed, latents_pt_packed, prefix):
   # Locate cached model files
-  cache_dir = f"/mnt/data/hf_cache/hub/models--{model_id.replace('/', '--')}/snapshots"
-  if not os.path.exists(cache_dir):
-    raise FileNotFoundError(f"Hugging Face cache directory not found: {cache_dir}")
-  snapshots = os.listdir(cache_dir)
-  snapshot_dir = os.path.join(cache_dir, snapshots[0])
+  snapshot_dir = get_model_snapshot_dir(model_id)
   print(f"\n[PyTorch] Loading '{model_id}' weights from: {snapshot_dir}")
 
   from diffusers.pipelines.flux2.pipeline_flux2_klein import Flux2KleinPipeline
@@ -134,7 +155,7 @@ def main():
   # PART I: FLUX.2-KLEIN-4B PARITY
   # =========================================================================
   print("\n" + "#" * 80)
-  print("🎬 STARTING PARITY EVALUATION FOR FLUX.2-KLEIN-4B")
+  print("STARTING PARITY EVALUATION FOR FLUX.2-KLEIN-4B")
   print("#" * 80)
 
   # 1. Run PyTorch 4B (FP32 & BF16)
@@ -153,7 +174,7 @@ def main():
   # 2. Run JAX 4B (via generate_flux2klein.py)
   print("\n[JAX 4B] Executing pipeline script generate_flux2klein.py...")
   cmd_jax_4b = [
-      "python3",
+      sys.executable,
       "src/maxdiffusion/generate_flux2klein.py",
       "src/maxdiffusion/configs/base_flux2klein.yml",
       "skip_jax_distributed_system=True",
@@ -181,7 +202,7 @@ def main():
   # PART II: FLUX.2-KLEIN-9B PARITY
   # =========================================================================
   print("\n" + "#" * 80)
-  print("🎬 STARTING PARITY EVALUATION FOR FLUX.2-KLEIN-9B")
+  print("STARTING PARITY EVALUATION FOR FLUX.2-KLEIN-9B")
   print("#" * 80)
   pt_9b_fp32_paths, pt_9b_bf16_paths = run_pytorch_pipeline(
       model_id="black-forest-labs/FLUX.2-klein-9B",
@@ -197,7 +218,7 @@ def main():
 
   print("\n[JAX 9B] Executing pipeline script generate_flux2klein.py...")
   cmd_jax_9b = [
-      "python3",
+      sys.executable,
       "src/maxdiffusion/generate_flux2klein.py",
       "src/maxdiffusion/configs/base_flux2klein_9B.yml",
       "skip_jax_distributed_system=True",
@@ -224,11 +245,11 @@ def main():
   # PART III: METRICS EVALUATION & COMPARISON REPORT
   # =========================================================================
   print("\n" + "=" * 80)
-  print("📊 BATCHED VISUAL ALIGNMENT COMPARISON REPORT")
+  print("BATCHED VISUAL ALIGNMENT COMPARISON REPORT")
   print("=" * 80)
 
   report = []
-  report.append("# 📈 Flux.2-klein Batched (Batch-4) E2E Parity Report")
+  report.append("# Flux.2-klein Batched (Batch-4) E2E Parity Report")
   report.append(f"Prompt: '{prompt}'\n")
 
   report.append("## 4B Model Parity (JAX TPU vs PyTorch CPU)")

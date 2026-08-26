@@ -14,32 +14,46 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import ast
 import gc
+import json
 import os
-import time
 import sys
+import time
 from typing import List
 
+from PIL import Image
 from absl import app
-import jax
-import jax.numpy as jnp
-import numpy as np
 import flax
 from flax import linen as nn
+from flax import nnx
 from flax.linen import partitioning as nn_partitioning
+from flax.linen import spmd as flax_spmd
+from huggingface_hub import snapshot_download
+import jax
+import jax.numpy as jnp
 from jax.sharding import Mesh
+import numpy as np
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, Qwen2TokenizerFast
 
-from maxdiffusion import pyconfig
-from maxdiffusion import max_logging
-from maxdiffusion import max_utils
-from maxdiffusion.max_utils import create_device_mesh
-from maxdiffusion.train_utils import transformer_engine_context
+try:
+  import torch
+except ImportError:
+  torch = None
 
-from maxdiffusion.models.vae_flax import FlaxAutoencoderKL
+from maxdiffusion import max_logging, max_utils, pyconfig
+from maxdiffusion.max_utils import create_device_mesh, get_flash_block_sizes
+from maxdiffusion.models.flux.transformers.transformer_flux_flax import NNXFlux2KleinTransformer2DModel
+from maxdiffusion.models.flux.util import load_and_convert_flux_klein_nnx_weights
+from maxdiffusion.models.flux.vae.autoencoder_kl_flux2_nnx import (
+    NNXAutoencoderKLFlux2,
+    load_and_convert_flux2klein_nnx_vae_weights,
+)
 from maxdiffusion.models.qwen3_flax import FlaxQwen3Config, FlaxQwen3Model
 from maxdiffusion.models.qwen3_utils import load_and_convert_qwen3_weights
-from maxdiffusion.schedulers.scheduling_flow_match_flax import FlaxFlowMatchScheduler
 from maxdiffusion.pipelines.flux.flux2klein_pipeline import FlaxFlux2KleinPipeline
+from maxdiffusion.schedulers.scheduling_flow_match_flax import FlaxFlowMatchScheduler
+from maxdiffusion.train_utils import transformer_engine_context
 
 
 def partition_prompts(prompt_str: str, batch_size: int) -> List[str]:
@@ -61,19 +75,13 @@ def partition_prompts(prompt_str: str, batch_size: int) -> List[str]:
     return active
   else:
     max_logging.log(
-        f"⚠️ Warning: Found {num_prompts} prompts, but batch_size is {batch_size}. Truncating to the first {batch_size}."
+        f"Warning: Found {num_prompts} prompts, but batch_size is {batch_size}. Truncating to the first {batch_size}."
     )
     return raw_prompts[:batch_size]
 
 
 def encode_prompt(prompt: str, snapshot_dir: str = None, repo_id: str = "black-forest-labs/FLUX.2-klein-4B"):
   """Encodes a prompt string into Qwen3 text embeddings using PyTorch text encoder on CPU."""
-  import os
-  import torch
-  import gc
-  from transformers import AutoTokenizer, AutoModelForCausalLM
-  from huggingface_hub import snapshot_download
-
   if snapshot_dir is None:
     snapshot_dir = snapshot_download(repo_id=repo_id)
 
@@ -139,15 +147,10 @@ def main(argv):
 
   is_interactive = any(arg and "interactive=True" in arg.replace(" ", "") for arg in default_args)
   if is_interactive:
-    max_logging.log("ℹ️ Interactive mode detected: overriding use_latents=False for dynamic inputs.")
+    max_logging.log("Interactive mode detected: overriding use_latents=False for dynamic inputs.")
     default_args.append("use_latents=False")
 
   pyconfig.initialize(default_args)
-
-  # Import modules after jax.distributed.initialize() has run via pyconfig.initialize()
-  from maxdiffusion.models.flux.util import (
-      load_and_convert_vae_weights,
-  )
 
   config = pyconfig.config
   os.makedirs(config.output_dir, exist_ok=True)
@@ -169,7 +172,7 @@ def main(argv):
     )
     if calculated_batch_size != config.batch_size:
       max_logging.log(
-          f"ℹ️ Updating batch_size from {config.batch_size} to {calculated_batch_size} "
+          f"Updating batch_size from {config.batch_size} to {calculated_batch_size} "
           f"based on per_device_batch_size={config.per_device_batch_size} and active_device_count={active_device_count}."
       )
       pyconfig._config.keys["batch_size"] = calculated_batch_size
@@ -187,7 +190,7 @@ def main(argv):
 
   if not custom_parallelism_set and active_device_count > 1:
     max_logging.log(
-        f"ℹ️ Defaulting to Tensor Parallelism: ici_tensor_parallelism={active_device_count} on {active_device_count} TPU devices."
+        f"Defaulting to Tensor Parallelism: ici_tensor_parallelism={active_device_count} on {active_device_count} TPU devices."
     )
     pyconfig._config.keys["ici_tensor_parallelism"] = active_device_count
     pyconfig._config.keys["ici_data_parallelism"] = 1
@@ -203,7 +206,7 @@ def main(argv):
   fsdp_size = mesh.shape.get("fsdp", 1)
   if config.batch_size % (data_size * fsdp_size) != 0:
     max_logging.log(
-        f"⚠️ Warning: batch_size ({config.batch_size}) is not divisible by FSDP*Data mesh size ({fsdp_size * data_size})."
+        f"Warning: batch_size ({config.batch_size}) is not divisible by FSDP*Data mesh size ({fsdp_size * data_size})."
     )
     max_logging.log(
         "  Automatically falling back to sharding batch dimension across 'data' axis only to prevent JAX SPMD errors."
@@ -217,7 +220,7 @@ def main(argv):
     pyconfig._config.keys["logical_axis_rules"] = tuple(new_rules)
 
   # 3. Resolve weights repository snapshots
-  repo_id = getattr(config, "pretrained_model_name_or_path", None)
+  repo_id = config.pretrained_model_name_or_path
   if not repo_id:
     raise ValueError("pretrained_model_name_or_path must be specified in configuration YAML or CLI.")
   max_logging.log(f"Target model detected: {repo_id}")
@@ -226,28 +229,16 @@ def main(argv):
     snapshot_dir = repo_id
     max_logging.log(f"Using local model directory: {snapshot_dir}")
   else:
-    from huggingface_hub import snapshot_download
-
-    rev = getattr(config, "revision", None)
-    if not rev or rev == "refs/pr/95":
-      rev = "main"
-    try:
-      snapshot_dir = snapshot_download(repo_id=repo_id, revision=rev, local_files_only=True)
-    except Exception:
-      snapshot_dir = snapshot_download(repo_id=repo_id, revision=rev)
+    rev = config.revision if config.revision and config.revision != "refs/pr/95" else "main"
+    snapshot_dir = snapshot_download(repo_id=repo_id, revision=rev)
 
   max_logging.log(f"Host {jax.process_index()} using HF snapshot directory: {snapshot_dir}")
   safetensors_path = os.path.join(snapshot_dir, "transformer")
   vae_safetensors_path = os.path.join(snapshot_dir, "vae", "diffusion_pytorch_model.safetensors")
   text_encoder_path = os.path.join(snapshot_dir, "text_encoder")
+  tokenizer_path = os.path.join(snapshot_dir, "tokenizer")
 
   # 4. Load Qwen3 Config & Setup model layout
-  from transformers import AutoConfig
-  from maxdiffusion.max_utils import get_flash_block_sizes
-  from flax import nnx
-  from maxdiffusion.models.flux.transformers.transformer_flux_flax import NNXFlux2KleinTransformer2DModel
-  from maxdiffusion.models.flux.util import load_and_convert_flux_klein_nnx_weights
-
   pt_config = AutoConfig.from_pretrained(text_encoder_path)
 
   te_bs = get_flash_block_sizes(
@@ -255,50 +246,61 @@ def main(argv):
           "Config",
           (),
           {
-              "flash_block_sizes": getattr(config, "text_encoder_flash_block_sizes", {}) or {},
-              "attention": getattr(config, "text_encoder_attention", "flash"),
+              "flash_block_sizes": config.text_encoder_flash_block_sizes or {},
+              "attention": config.text_encoder_attention,
           },
       )()
   )
 
-  qwen3_config = FlaxQwen3Config(
-      vocab_size=pt_config.vocab_size,
-      hidden_size=pt_config.hidden_size,
-      intermediate_size=pt_config.intermediate_size,
-      num_hidden_layers=pt_config.num_hidden_layers,
-      num_attention_heads=pt_config.num_attention_heads,
-      num_key_value_heads=pt_config.num_key_value_heads,
-      max_position_embeddings=pt_config.max_position_embeddings,
-      rms_norm_eps=pt_config.rms_norm_eps,
-      rope_theta=pt_config.rope_theta,
-      dtype=jnp.bfloat16 if config.weights_dtype == "bfloat16" else jnp.float32,
-      attention_kernel=getattr(config, "text_encoder_attention", "flash"),
-      flash_block_sizes=te_bs,
-      mesh=mesh,
-      ulysses_shards=getattr(config, "ulysses_shards", -1),
-      ulysses_attention_chunks=getattr(config, "ulysses_attention_chunks", 1),
-      max_layer_to_run=getattr(config, "text_encoder_max_layer", 27),
-      is_causal=getattr(config, "text_encoder_is_causal", True),
-  )
+  rope_theta = None
+  if hasattr(pt_config, "rope_parameters") and isinstance(pt_config.rope_parameters, dict):
+    rope_theta = pt_config.rope_parameters.get("rope_theta")
+  if rope_theta is None:
+    rope_theta = getattr(pt_config, "rope_theta", None) or getattr(pt_config, "rope_base", None)
+
+  qwen_kwargs = {
+      "vocab_size": pt_config.vocab_size,
+      "hidden_size": pt_config.hidden_size,
+      "intermediate_size": pt_config.intermediate_size,
+      "num_hidden_layers": pt_config.num_hidden_layers,
+      "num_attention_heads": pt_config.num_attention_heads,
+      "num_key_value_heads": pt_config.num_key_value_heads,
+      "max_position_embeddings": pt_config.max_position_embeddings,
+      "rms_norm_eps": pt_config.rms_norm_eps,
+      "dtype": jnp.bfloat16 if config.weights_dtype == "bfloat16" else jnp.float32,
+      "attention_kernel": config.text_encoder_attention,
+      "flash_block_sizes": te_bs,
+      "mesh": mesh,
+      "ulysses_shards": config.ulysses_shards,
+      "ulysses_attention_chunks": config.ulysses_attention_chunks,
+      "max_layer_to_run": config.text_encoder_max_layer,
+  }
+  if rope_theta is not None:
+    qwen_kwargs["rope_theta"] = rope_theta
+
+  qwen3_config = FlaxQwen3Config(**qwen_kwargs)
   qwen3_model = FlaxQwen3Model(qwen3_config)
 
   # Load Transformer config for layer counts if present
   transformer_pt_cfg = {}
   transformer_config_json = os.path.join(safetensors_path, "config.json")
   if os.path.exists(transformer_config_json):
-    try:
-      import json
-
-      with open(transformer_config_json, "r") as f:
-        transformer_pt_cfg = json.load(f)
-    except Exception:
-      pass
+    with open(transformer_config_json, "r") as f:
+      transformer_pt_cfg = json.load(f)
 
   num_double_layers = getattr(config, "num_double_layers", None) or transformer_pt_cfg.get("num_layers", 5)
   depth = getattr(config, "depth", None) or transformer_pt_cfg.get("num_single_layers", 20)
   num_attention_heads = getattr(config, "num_attention_heads", None) or transformer_pt_cfg.get("num_attention_heads", 24)
 
   # 5. Instantiate JAX NNXFlux2KleinTransformer2DModel
+  guidance_embeds = getattr(config, "guidance_embeds", None)
+  if guidance_embeds is None:
+    guidance_embeds = transformer_pt_cfg.get("guidance_embeds", False)
+
+  pooled_projection_dim = getattr(config, "pooled_projection_dim", None)
+  if pooled_projection_dim is None:
+    pooled_projection_dim = transformer_pt_cfg.get("pooled_projection_dim", None)
+
   transformer = NNXFlux2KleinTransformer2DModel(
       rngs=nnx.Rngs(0),
       in_channels=128,
@@ -307,8 +309,8 @@ def main(argv):
       attention_head_dim=128,
       num_attention_heads=num_attention_heads,
       joint_attention_dim=3 * pt_config.hidden_size,
-      pooled_projection_dim=768,
-      guidance_embeds=True,
+      pooled_projection_dim=pooled_projection_dim,
+      guidance_embeds=guidance_embeds,
       axes_dim=(32, 32, 32, 32),
       theta=2000.0,
       mlp_ratio=3.0,
@@ -318,59 +320,45 @@ def main(argv):
       mesh=mesh,
       dtype=jnp.bfloat16 if config.weights_dtype == "bfloat16" else jnp.float32,
       weights_dtype=jnp.bfloat16 if config.weights_dtype == "bfloat16" else jnp.float32,
-      scale_shift_order=getattr(config, "scale_shift_order", "scale_shift"),
-      ulysses_shards=getattr(config, "ulysses_shards", -1),
-      ulysses_attention_chunks=getattr(config, "ulysses_attention_chunks", 1),
+      scale_shift_order=config.scale_shift_order,
+      ulysses_shards=config.ulysses_shards,
+      ulysses_attention_chunks=config.ulysses_attention_chunks,
+      use_base2_exp=config.use_base2_exp,
   )
 
-  # 6. Instantiate JAX VAE
-  vae = FlaxAutoencoderKL(
-      in_channels=3,
-      out_channels=3,
-      down_block_types=("DownEncoderBlock2D", "DownEncoderBlock2D", "DownEncoderBlock2D", "DownEncoderBlock2D"),
-      up_block_types=("UpDecoderBlock2D", "UpDecoderBlock2D", "UpDecoderBlock2D", "UpDecoderBlock2D"),
-      block_out_channels=(128, 256, 512, 512),
-      layers_per_block=2,
-      act_fn="silu",
-      latent_channels=32,
-      norm_num_groups=32,
-      sample_size=512,
-      use_quant_conv=True,
-      use_post_quant_conv=True,
-      dtype=jnp.bfloat16 if config.weights_dtype == "bfloat16" else jnp.float32,
+  # 6. Instantiate JAX NNX VAE
+  weight_dtype = jnp.bfloat16 if config.weights_dtype == "bfloat16" else jnp.float32
+  vae = NNXAutoencoderKLFlux2(
+      dtype=weight_dtype,
+      param_dtype=weight_dtype,
   )
 
   # 7. Evaluate shapes & extract mesh shardings
   max_logging.log("Evaluating model shapes and shardings...")
   seq_len_txt = config.max_sequence_length
-  dummy_img = jnp.zeros((config.batch_size, 3, 512, 512))
   dummy_ids = jnp.zeros((config.batch_size, seq_len_txt), dtype=jnp.int32)
   dummy_mask = jnp.zeros((config.batch_size, seq_len_txt), dtype=jnp.int32)
 
   key = jax.random.PRNGKey(0)
-  vae_key, qwen_key = jax.random.split(key, 2)
+  qwen_key = jax.random.split(key, 1)[0]
 
   abstract_state = nnx.state(transformer, nnx.Param)
-
-  def vae_init_fn():
-    return vae.init(vae_key, dummy_img)
+  abstract_vae_state = nnx.state(vae, nnx.Param)
 
   def qwen3_init_fn():
     return qwen3_model.init(qwen_key, dummy_ids, dummy_mask)
 
   with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
     logical_transformer_specs = nnx.get_partition_spec(abstract_state)
-    abstract_vae_vars = jax.eval_shape(vae_init_fn)
+    logical_vae_specs = nnx.get_partition_spec(abstract_vae_state)
     abstract_qwen3_vars = jax.eval_shape(qwen3_init_fn)
-
-    logical_vae_specs = nn.get_partition_spec(abstract_vae_vars)
     logical_qwen3_specs = nn.get_partition_spec(abstract_qwen3_vars)
 
     transformer_mesh_shardings = nn.logical_to_mesh_sharding(logical_transformer_specs, mesh, config.logical_axis_rules)
     vae_mesh_shardings = nn.logical_to_mesh_sharding(logical_vae_specs, mesh, config.logical_axis_rules)
     qwen3_mesh_shardings = nn.logical_to_mesh_sharding(logical_qwen3_specs, mesh, config.logical_axis_rules)
 
-  vae_shardings = flax.core.freeze(vae_mesh_shardings["params"])
+  vae_shardings = vae_mesh_shardings
   qwen3_shardings = flax.core.freeze(qwen3_mesh_shardings["params"])
   transformer_shardings = transformer_mesh_shardings
 
@@ -380,43 +368,35 @@ def main(argv):
   cpu_device = jax.local_devices(backend="cpu")[0]
   with jax.default_device(cpu_device):
     with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
-      import flax.linen.spmd as flax_spmd
 
       def unbox_fn(x):
         return x.unbox() if isinstance(x, flax_spmd.LogicallyPartitioned) else x
 
       t_sub0 = time.time()
-      vae_params = jax.tree_util.tree_map(
-          unbox_fn, abstract_vae_vars["params"], is_leaf=lambda k: isinstance(k, flax_spmd.LogicallyPartitioned)
-      )
-      vae_params = flax.core.unfreeze(vae_params)
-
       qwen3_params = jax.tree_util.tree_map(
           unbox_fn, abstract_qwen3_vars["params"], is_leaf=lambda k: isinstance(k, flax_spmd.LogicallyPartitioned)
       )
       qwen3_params = flax.core.unfreeze(qwen3_params)
-
       max_logging.log(f" -> [SUB-TIMING 1/3] PyTree unboxing template setup: {time.time() - t_sub0:.2f}s")
+
       t_sub1 = time.time()
-
-      weight_dtype = jnp.bfloat16 if config.weights_dtype == "bfloat16" else jnp.float32
-
       params = load_and_convert_flux_klein_nnx_weights(
           safetensors_path, abstract_state, num_double_layers, depth, dtype=weight_dtype
       )
-      vae_params, vae_bn_mean, vae_bn_std = load_and_convert_vae_weights(
-          vae_safetensors_path, vae_params, dtype=weight_dtype
-      )
+      nnx.update(transformer, params)
+      params = nnx.state(transformer, nnx.Param)
+
+      vae_bn_mean, vae_bn_std = load_and_convert_flux2klein_nnx_vae_weights(vae_safetensors_path, vae, dtype=weight_dtype)
+      vae_params = nnx.state(vae, nnx.Param)
       qwen3_params = load_and_convert_qwen3_weights(text_encoder_path, qwen3_params, qwen3_config)
       max_logging.log(
           f" -> [SUB-TIMING 2/3] Safetensors loading & key mapping (in target dtype): {time.time() - t_sub1:.4f}s"
       )
 
-      vae_params = flax.core.freeze(vae_params)
       qwen3_params = flax.core.freeze(qwen3_params)
 
       max_logging.log("\n" + "=" * 80)
-      max_logging.log("🚀 Pinning all parameters to TPU HBM permanently...")
+      max_logging.log("Pinning all parameters to TPU HBM permanently...")
       max_logging.log("=" * 80 + "\n")
       t_sub3 = time.time()
       max_logging.log("Putting params on TPU HBM...")
@@ -432,7 +412,7 @@ def main(argv):
       jax.effects_barrier()
 
   load_time = time.time() - t_load_start
-  max_logging.log(f" -> [TIMING] Total Model Loading & Device Placement: {load_time:.4f} seconds ⏱️\n")
+  max_logging.log(f" -> [TIMING] Total Model Loading & Device Placement: {load_time:.4f} seconds\n")
 
   # 9. Setup FlowMatch Scheduler
   scheduler = FlaxFlowMatchScheduler(
@@ -447,32 +427,57 @@ def main(argv):
       time_shift_type="exponential",
   )
 
+  if os.path.exists(tokenizer_path):
+    tokenizer = Qwen2TokenizerFast.from_pretrained(tokenizer_path, local_files_only=True)
+  else:
+    tokenizer = Qwen2TokenizerFast.from_pretrained(snapshot_dir, subfolder="tokenizer", local_files_only=True)
+
   # 10. Instantiate and invoke FlaxFlux2KleinPipeline
   max_logging.log("Instantiating JAX FlaxFlux2KleinPipeline...")
   pipeline = FlaxFlux2KleinPipeline(
       transformer=transformer,
       vae=vae,
       text_encoder=qwen3_model,
-      tokenizer=None,
+      tokenizer=tokenizer,
       scheduler=scheduler,
       config=config,
       mesh=mesh,
   )
 
-  prompt_str = getattr(config, "prompt", None)
+  prompt_str = config.prompt
   if not prompt_str:
     raise ValueError("Prompt must be specified in the configuration YAML or passed via CLI prompt='...'")
   active_prompts = partition_prompts(prompt_str, config.batch_size)
 
-  if getattr(config, "interactive", False):
+  # Parse reference image paths for multi-image editing if provided
+  images = None
+  image_paths = config.image_paths
+  if image_paths:
+    if isinstance(image_paths, str) and image_paths.strip():
+      try:
+        image_paths = ast.literal_eval(image_paths)
+      except Exception:
+        image_paths = [p.strip() for p in image_paths.split(",") if p.strip()]
+    if isinstance(image_paths, (list, tuple)) and len(image_paths) > 0:
+      max_logging.log(f" -> Loading {len(image_paths)} reference image(s) for multi-image editing...")
+      images = []
+      for p in image_paths:
+        if not os.path.exists(p):
+          raise FileNotFoundError(f"Reference image file not found: {p}")
+        with Image.open(p) as img_raw:
+          img = img_raw.convert("RGB")
+          images.append(img)
+
+  if config.interactive:
     max_logging.log("\n" + "=" * 80)
-    max_logging.log("   BATCHED INTERACTIVE GENERATION MODE ENABLED 🎮")
+    max_logging.log("   BATCHED INTERACTIVE GENERATION MODE ENABLED")
     max_logging.log("The model has been fully loaded and compiled on the TPU.")
     max_logging.log(f"Batch size: {config.batch_size} parallel images.")
     max_logging.log("Enter prompts separated by '||' (e.g. A cute cat || A red car)")
     max_logging.log("Type 'exit' to quit.")
     max_logging.log("=" * 80)
 
+    timing_flag = config.timing or config.write_timing_metrics
     image_idx = 1
     while True:
       try:
@@ -501,23 +506,26 @@ def main(argv):
           width=config.width,
           num_inference_steps=config.num_inference_steps,
           batch_size=config.batch_size,
+          images=images,
           use_latents=False,
+          timing=timing_flag,
           output_dir=config.output_dir,
           output_name=output_file,
       )
       image_idx += 1
   else:
+    timing_flag = config.timing or config.write_timing_metrics
     # Run one-shot generation
     latents_to_use = None
     use_latents_flag = False
-    if getattr(config, "latents_path", ""):
+    if config.latents_path:
       max_logging.log(f"Loading custom starting noise latents from: {config.latents_path}...")
       latents_to_use = np.load(config.latents_path)
       use_latents_flag = True
       max_logging.log(f" -> Custom latents shape: {latents_to_use.shape} | sum: {latents_to_use.sum():.6f}")
 
     max_logging.log("\n" + "=" * 80)
-    max_logging.log("🚀 Pre-compiling XLA graphs concurrently (AOT Compilation)...")
+    max_logging.log("Pre-compiling XLA graphs concurrently (AOT Compilation)...")
     max_logging.log("=" * 80)
     aot_time = pipeline.compile_aot_async(
         params=params,
@@ -528,10 +536,11 @@ def main(argv):
         batch_size=config.batch_size,
         height=config.height,
         width=config.width,
+        images=images,
     )
 
     max_logging.log("\n" + "=" * 80)
-    max_logging.log("🚀 Running initial dry run (Warmup Pass) to verify compiled graph execution...")
+    max_logging.log("Running initial dry run (Warmup Pass) to verify compiled graph execution...")
     max_logging.log("=" * 80)
     _, warmup_trace = pipeline(
         prompt=active_prompts,
@@ -547,21 +556,25 @@ def main(argv):
         width=config.width,
         num_inference_steps=config.num_inference_steps,
         batch_size=config.batch_size,
+        images=images,
         use_latents=use_latents_flag,
         latents=latents_to_use,
+        timing=timing_flag,
         output_dir=config.output_dir,
         output_name="flux2klein_warmup.png",
         warmup=True,
     )
-    warmup_time = (
-        warmup_trace.get("prompt_encoding", 0.0)
+    warmup_time = warmup_trace.get(
+        "e2e_pipeline_total",
+        warmup_trace.get("vae_encode", 0.0)
+        + warmup_trace.get("prompt_encoding", 0.0)
         + warmup_trace.get("denoise_loop", 0.0)
-        + warmup_trace.get("vae_decode", 0.0)
+        + warmup_trace.get("vae_decode", 0.0),
     )
 
-    num_reps = int(getattr(config, "num_reps", 1))
+    num_reps = int(config.num_reps)
     max_logging.log("\n" + "=" * 80)
-    max_logging.log(f"⏱️ Running timed pass at full TPU speed (num_reps={num_reps})...")
+    max_logging.log(f"Running timed pass at full TPU speed (num_reps={num_reps})...")
     max_logging.log("=" * 80)
 
     main_traces = []
@@ -570,10 +583,10 @@ def main(argv):
     for rep in range(num_reps):
       rep_str = f" [Rep {rep+1}/{num_reps}]" if num_reps > 1 else ""
       if rep > 0:
-        max_logging.log(f"⏱️ Running timed pass{rep_str}...")
+        max_logging.log(f"Running timed pass{rep_str}...")
 
       if max_utils.profiler_enabled(config) and rep == 0:
-        max_logging.log(f"🚀 XProf / JAX Profiler active! Capturing trace into: {config.tensorboard_dir}")
+        max_logging.log(f"XProf / JAX Profiler active! Capturing trace into: {config.tensorboard_dir}")
         with max_utils.Profiler(config, session_name="flux2klein_inference"):
           _, trace_i = pipeline(
               prompt=active_prompts,
@@ -589,8 +602,10 @@ def main(argv):
               width=config.width,
               num_inference_steps=config.num_inference_steps,
               batch_size=config.batch_size,
+              images=images,
               use_latents=use_latents_flag,
               latents=latents_to_use,
+              timing=timing_flag,
               output_dir=config.output_dir,
               output_name=f"rep_{rep+1}_{config.output_name}" if num_reps > 1 else config.output_name,
           )
@@ -609,58 +624,96 @@ def main(argv):
             width=config.width,
             num_inference_steps=config.num_inference_steps,
             batch_size=config.batch_size,
+            images=images,
             use_latents=use_latents_flag,
             latents=latents_to_use,
+            timing=timing_flag,
             output_dir=config.output_dir,
             output_name=f"rep_{rep+1}_{config.output_name}" if num_reps > 1 else config.output_name,
         )
 
       tot_time_i = trace_i.get(
           "e2e_pipeline_total",
-          trace_i.get("prompt_encoding", 0.0) + trace_i.get("denoise_loop", 0.0) + trace_i.get("vae_decode", 0.0),
+          trace_i.get("vae_encode", 0.0)
+          + trace_i.get("prompt_encoding", 0.0)
+          + trace_i.get("denoise_loop", 0.0)
+          + trace_i.get("vae_decode", 0.0),
       )
       main_traces.append(trace_i)
       main_times.append(tot_time_i)
       if num_reps > 1:
-        max_logging.log(
-            f"   -> Rep {rep+1}/{num_reps} Completed: Total={tot_time_i:.4f}s | Qwen3={trace_i.get('qwen3_encoding', 0.0):.4f}s | Denoise={trace_i.get('denoise_loop', 0.0):.4f}s | VAE={trace_i.get('vae_decode', 0.0):.4f}s"
-        )
+        if timing_flag:
+          vae_enc_str = f" | VAE_Enc={trace_i.get('vae_encode', 0.0):.4f}s" if trace_i.get("vae_encode", 0.0) > 0 else ""
+          max_logging.log(
+              f"   -> Rep {rep+1}/{num_reps} Completed: Total={tot_time_i:.4f}s{vae_enc_str} | Qwen3={trace_i.get('qwen3_encoding', 0.0):.4f}s | Denoise={trace_i.get('denoise_loop', 0.0):.4f}s | VAE_Dec={trace_i.get('vae_decode', 0.0):.4f}s"
+          )
+        else:
+          max_logging.log(f"   -> Rep {rep+1}/{num_reps} Completed: Total={tot_time_i:.4f}s")
 
     avg_main_time = sum(main_times) / num_reps
-    avg_start_to_qwen3 = sum(tr.get("start_to_qwen3", 0.0) for tr in main_traces) / num_reps
-    avg_prompt_enc = sum(tr.get("qwen3_encoding", tr.get("prompt_encoding", 0.0)) for tr in main_traces) / num_reps
-    avg_qwen3_to_denoise = sum(tr.get("qwen3_to_denoise", 0.0) for tr in main_traces) / num_reps
-    avg_denoise = sum(tr.get("denoise_loop", 0.0) for tr in main_traces) / num_reps
-    avg_denoise_to_vae = sum(tr.get("denoise_to_vae", 0.0) for tr in main_traces) / num_reps
-    avg_vae_decode = sum(tr.get("vae_decode", 0.0) for tr in main_traces) / num_reps
-    avg_image_saving = sum(tr.get("image_saving", 0.0) for tr in main_traces) / num_reps
-
     total_cold_start = load_time + aot_time + warmup_time
 
     max_logging.log("\n" + "=" * 80)
-    max_logging.log("📊 FLUX.2-KLEIN COMPLETE LATENCY & TIMING BREAKDOWN")
+    max_logging.log("FLUX.2-KLEIN COMPLETE LATENCY & TIMING BREAKDOWN")
     max_logging.log("=" * 80)
-    max_logging.log(f"1) Model Loading & Placement Time:              {load_time:.4f} seconds ⏱️")
-    max_logging.log(f"2) Concurrent AOT XLA Compilation Time:         {aot_time:.4f} seconds ⚡")
-    max_logging.log(f"3) Warmup Pass Execution Time:                   {warmup_time:.4f} seconds ⏱️")
-    max_logging.log(f"   - Qwen3 Encoding:  {warmup_trace.get('prompt_encoding', 0.0):.4f}s")
-    max_logging.log(f"   - Flux Denoising:  {warmup_trace.get('denoise_loop', 0.0):.4f}s")
-    max_logging.log(f"   - VAE Decoding:    {warmup_trace.get('vae_decode', 0.0):.4f}s")
-    max_logging.log(f"👉 TOTAL COLD-START TIME (Loading + AOT + Warmup): {total_cold_start:.4f} seconds 🎯")
+    max_logging.log(f"1) Model Loading & Placement Time:              {load_time:.4f} seconds")
+    max_logging.log(f"2) Concurrent AOT XLA Compilation Time:         {aot_time:.4f} seconds")
+    max_logging.log(f"3) Warmup Pass Execution Time:                   {warmup_time:.4f} seconds")
+    if timing_flag:
+      if warmup_trace.get("vae_encode", 0.0) > 0:
+        max_logging.log(f"   - VAE Encoding:    {warmup_trace.get('vae_encode', 0.0):.4f}s")
+      max_logging.log(f"   - Qwen3 Encoding:  {warmup_trace.get('prompt_encoding', 0.0):.4f}s")
+      max_logging.log(f"   - Flux Denoising:  {warmup_trace.get('denoise_loop', 0.0):.4f}s")
+      max_logging.log(f"   - VAE Decoding:    {warmup_trace.get('vae_decode', 0.0):.4f}s")
+    max_logging.log(f"TOTAL COLD-START TIME (Loading + AOT + Warmup): {total_cold_start:.4f} seconds")
     rep_label = f" (Average across {num_reps} reps)" if num_reps > 1 else ""
-    max_logging.log(f"4) Main Warmed-Up Pass (Pure Inference Latency){rep_label}: {avg_main_time:.4f} seconds ⏱️")
-    max_logging.log(f"   - 1. Start -> Qwen3:          {avg_start_to_qwen3*1000:.2f} ms ({avg_start_to_qwen3:.4f}s)")
-    max_logging.log(f"   - 2. Qwen3 Encoding:         {avg_prompt_enc*1000:.2f} ms ({avg_prompt_enc:.4f}s)")
-    max_logging.log(f"   - 3. Qwen3 -> Denoising:      {avg_qwen3_to_denoise*1000:.2f} ms ({avg_qwen3_to_denoise:.4f}s)")
-    max_logging.log(f"   - 4. Flux Denoising Loop:    {avg_denoise*1000:.2f} ms ({avg_denoise:.4f}s)")
-    max_logging.log(f"   - 5. Denoising -> VAE:       {avg_denoise_to_vae*1000:.2f} ms ({avg_denoise_to_vae:.4f}s)")
-    max_logging.log(f"   - 6. VAE Decoding:           {avg_vae_decode*1000:.2f} ms ({avg_vae_decode:.4f}s)")
-    max_logging.log(f"   - 7. Image Saving:           {avg_image_saving*1000:.2f} ms ({avg_image_saving:.4f}s)")
-    max_logging.log(f"   - 👉 TOTAL E2E PIPELINE:     {avg_main_time*1000:.2f} ms ({avg_main_time:.4f}s)")
+    max_logging.log(f"4) Main Warmed-Up Pass (Pure Inference Latency){rep_label}: {avg_main_time:.4f} seconds")
+
+    if timing_flag:
+      avg_vae_encode = sum(tr.get("vae_encode", 0.0) for tr in main_traces) / num_reps
+      avg_vae_to_qwen3 = sum(tr.get("vae_encode_to_qwen3", 0.0) for tr in main_traces) / num_reps
+      avg_start_to_qwen3 = sum(tr.get("start_to_qwen3", 0.0) for tr in main_traces) / num_reps
+      avg_prompt_enc = sum(tr.get("qwen3_encoding", tr.get("prompt_encoding", 0.0)) for tr in main_traces) / num_reps
+      avg_qwen3_to_denoise = sum(tr.get("qwen3_to_denoise", 0.0) for tr in main_traces) / num_reps
+      avg_denoise = sum(tr.get("denoise_loop", 0.0) for tr in main_traces) / num_reps
+      avg_denoise_to_vae = sum(tr.get("denoise_to_vae", 0.0) for tr in main_traces) / num_reps
+      avg_vae_decode = sum(tr.get("vae_decode", 0.0) for tr in main_traces) / num_reps
+      avg_image_saving = sum(tr.get("image_saving", 0.0) for tr in main_traces) / num_reps
+
+      step_num = 1
+      if avg_vae_encode > 0:
+        max_logging.log(f"   - {step_num}. VAE Image Encoding:       {avg_vae_encode*1000:.2f} ms ({avg_vae_encode:.4f}s)")
+        step_num += 1
+        max_logging.log(
+            f"   - {step_num}. VAE -> Qwen3:             {avg_vae_to_qwen3*1000:.2f} ms ({avg_vae_to_qwen3:.4f}s)"
+        )
+        step_num += 1
+      else:
+        max_logging.log(
+            f"   - {step_num}. Start -> Qwen3:          {avg_start_to_qwen3*1000:.2f} ms ({avg_start_to_qwen3:.4f}s)"
+        )
+        step_num += 1
+      max_logging.log(f"   - {step_num}. Qwen3 Encoding:         {avg_prompt_enc*1000:.2f} ms ({avg_prompt_enc:.4f}s)")
+      step_num += 1
+      max_logging.log(
+          f"   - {step_num}. Qwen3 -> Denoising:      {avg_qwen3_to_denoise*1000:.2f} ms ({avg_qwen3_to_denoise:.4f}s)"
+      )
+      step_num += 1
+      max_logging.log(f"   - {step_num}. Flux Denoising Loop:    {avg_denoise*1000:.2f} ms ({avg_denoise:.4f}s)")
+      step_num += 1
+      max_logging.log(
+          f"   - {step_num}. Denoising -> VAE:       {avg_denoise_to_vae*1000:.2f} ms ({avg_denoise_to_vae:.4f}s)"
+      )
+      step_num += 1
+      max_logging.log(f"   - {step_num}. VAE Decoding:           {avg_vae_decode*1000:.2f} ms ({avg_vae_decode:.4f}s)")
+      step_num += 1
+      max_logging.log(f"   - {step_num}. Image Saving:           {avg_image_saving*1000:.2f} ms ({avg_image_saving:.4f}s)")
+
+    max_logging.log(f"   - TOTAL E2E PIPELINE:     {avg_main_time*1000:.2f} ms ({avg_main_time:.4f}s)")
     max_logging.log("=" * 80)
 
     max_logging.log("\n=======================================================")
-    max_logging.log(f"SUCCESS! Batched generation complete for {config.batch_size} images! 🎨🎉")
+    max_logging.log(f"SUCCESS! Batched generation complete for {config.batch_size} images!")
     max_logging.log("=======================================================\n")
 
 

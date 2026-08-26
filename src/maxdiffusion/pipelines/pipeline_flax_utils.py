@@ -40,8 +40,11 @@ from ..utils import (
     logging,
 )
 
-
-from transformers import FlaxPreTrainedModel
+try:
+  from transformers import FlaxPreTrainedModel
+except ImportError:
+  # FlaxPreTrainedModel was removed from top-level transformers in transformers >= 5.0.0.
+  FlaxPreTrainedModel = None
 
 INDEX_FILE = "diffusion_flax_model.bin"
 
@@ -514,7 +517,7 @@ class FlaxDiffusionPipeline(ConfigMixin, PushToHubMixin):
               quant=quant,
           )
           params[name] = loaded_params
-        elif issubclass(class_obj, FlaxPreTrainedModel):
+        elif FlaxPreTrainedModel is not None and issubclass(class_obj, FlaxPreTrainedModel):
           if from_pt:
             # TODO(Suraj): Fix this in Transformers. We should be able to use `_do_init=False` here
             loaded_sub_model = load_method(loadable_folder, from_pt=from_pt)

@@ -14,20 +14,22 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+from concurrent.futures import ThreadPoolExecutor
+import math
 import os
 import time
-from typing import List, Union, Optional, Any
-from PIL import Image
+from typing import Any, List, Optional, Union
 
-import sys
+from PIL import Image
+from flax import nnx
+from flax.linen import partitioning as nn_partitioning
 import jax
-import jax.numpy as jnp
 from jax.experimental import multihost_utils
+import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 import numpy as np
-from flax.linen import partitioning as nn_partitioning
+from transformers import Qwen2TokenizerFast
 
-from flax import nnx
 from maxdiffusion import max_logging
 from maxdiffusion.max_utils import device_put_replicated
 from ..pipeline_flax_utils import FlaxDiffusionPipeline
@@ -35,13 +37,18 @@ from ...models.flux.transformers.transformer_flux_flax import (
     Flux2KleinTransformer2DModel,
     NNXFlux2KleinTransformer2DModel,
 )
-from ...models.vae_flax import FlaxAutoencoderKL, FlaxDecoderOutput
 from ...models.qwen3_flax import FlaxQwen3Model
-from ...schedulers.scheduling_flow_match_flax import FlaxFlowMatchScheduler, compute_empirical_mu
+from ...models.vae_flax import FlaxAutoencoderKL, FlaxDecoderOutput
+from ...schedulers.scheduling_flow_match_flax import (
+    FlaxFlowMatchScheduler,
+    compute_empirical_mu,
+)
 
 from ...models.flux.util import (
     pack_latents,
+    patchify_latents,
     prepare_latent_image_ids,
+    prepare_multi_image_ids,
     prepare_text_ids,
 )
 
@@ -72,7 +79,7 @@ class FlaxFlux2KleinPipeline(FlaxDiffusionPipeline):
         scheduler=scheduler,
     )
     self._config = config
-    max_layer = getattr(config, "text_encoder_max_layer", 27)
+    max_layer = config.text_encoder_max_layer
     if max_layer is not None and max_layer < 27:
       raise ValueError(
           f"Invalid configuration `text_encoder_max_layer={max_layer}`. "
@@ -82,29 +89,26 @@ class FlaxFlux2KleinPipeline(FlaxDiffusionPipeline):
     self.mesh = mesh
     self.tokenizer = tokenizer
     if self.tokenizer is None:
-      tokenizer_path = getattr(config, "tokenizer_model_name_or_path", None) or getattr(
-          config, "pretrained_model_name_or_path", ""
-      )
+      tokenizer_path = config.tokenizer_model_name_or_path or config.pretrained_model_name_or_path
       hf_home = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
       repo_cache = os.path.join(
           hf_home,
           "hub",
-          f"models--{getattr(config, 'pretrained_model_name_or_path', '').replace('/', '--')}",
+          f"models--{config.pretrained_model_name_or_path.replace('/', '--')}",
           "snapshots",
       )
       if os.path.exists(repo_cache) and os.listdir(repo_cache):
         tokenizer_path = os.path.join(repo_cache, os.listdir(repo_cache)[0])
 
-      from transformers import Qwen2TokenizerFast
-
-      try:
+      if os.path.exists(tokenizer_path):
         self.tokenizer = Qwen2TokenizerFast.from_pretrained(tokenizer_path, local_files_only=True)
-      except Exception:
+      else:
         self.tokenizer = Qwen2TokenizerFast.from_pretrained(tokenizer_path, subfolder="tokenizer", local_files_only=True)
 
     # JIT compilation cache
     self._jitted_qwen3_forward = None
     self._jitted_transformer_step = None
+    self._jitted_vae_encode = None
     self._jitted_vae_decode = None
 
   def _setup_jit_functions(self):
@@ -123,22 +127,57 @@ class FlaxFlux2KleinPipeline(FlaxDiffusionPipeline):
       prompt_embeds = jax.lax.with_sharding_constraint(prompt_embeds, jax.sharding.NamedSharding(self.mesh, context_spec))
       return prompt_embeds
 
-    @jax.jit(static_argnums=(4, 5), donate_argnums=(1,))
-    def vae_decode(v_params, latents_packed, vae_bn_mean, vae_bn_std, height, width):
-      batch_size_val = latents_packed.shape[0]
-      h_latent = height // 8
-      w_latent = width // 8
+    if isinstance(self.vae, nnx.Module):
+      v_graph, _, v_rest = nnx.split(self.vae, nnx.Param, ...)
 
-      vae_bn_mean_seq = vae_bn_mean.reshape(1, 1, 128)
-      vae_bn_std_seq = vae_bn_std.reshape(1, 1, 128)
+      @jax.jit
+      def vae_encode(v_params, img):
+        merged = nnx.merge(v_graph, v_params, v_rest)
+        return merged.encode(img)
 
-      latents_bn = latents_packed * vae_bn_std_seq + vae_bn_mean_seq
-      latents_unpacked = jnp.reshape(latents_bn, (batch_size_val, h_latent // 2, w_latent // 2, 32, 2, 2))
-      latents_unpacked = jnp.transpose(latents_unpacked, (0, 3, 1, 4, 2, 5))
-      latents_unpacked = jnp.reshape(latents_unpacked, (batch_size_val, 32, h_latent, w_latent))
+      @jax.jit(static_argnums=(4, 5), donate_argnums=(1,))
+      def vae_decode(v_params, latents_packed, vae_bn_mean, vae_bn_std, height, width):
+        batch_size_val = latents_packed.shape[0]
+        h_latent = height // 8
+        w_latent = width // 8
 
-      res = self.vae.apply({"params": v_params}, latents=latents_unpacked, method=self.vae.decode)
-      return FlaxDecoderOutput(sample=res.sample)
+        vae_bn_mean_seq = vae_bn_mean.reshape(1, 1, 128)
+        vae_bn_std_seq = vae_bn_std.reshape(1, 1, 128)
+
+        latents_bn = latents_packed * vae_bn_std_seq + vae_bn_mean_seq
+        latents_unpacked = jnp.reshape(latents_bn, (batch_size_val, h_latent // 2, w_latent // 2, 32, 2, 2))
+        latents_unpacked = jnp.transpose(latents_unpacked, (0, 3, 1, 4, 2, 5))
+        latents_unpacked = jnp.reshape(latents_unpacked, (batch_size_val, 32, h_latent, w_latent))
+
+        merged = nnx.merge(v_graph, v_params, v_rest)
+        res = merged.decode(latents_unpacked)
+        return FlaxDecoderOutput(sample=res)
+
+    else:
+
+      @jax.jit
+      def vae_encode(v_params, img):
+        # FlaxAutoencoderKL expects (B, 3, H, W)
+        res = self.vae.apply({"params": v_params}, sample=img, method=self.vae.encode)
+        moments = res.latent_dist.mode()
+        return jnp.transpose(moments, (0, 3, 1, 2))
+
+      @jax.jit(static_argnums=(4, 5), donate_argnums=(1,))
+      def vae_decode(v_params, latents_packed, vae_bn_mean, vae_bn_std, height, width):
+        batch_size_val = latents_packed.shape[0]
+        h_latent = height // 8
+        w_latent = width // 8
+
+        vae_bn_mean_seq = vae_bn_mean.reshape(1, 1, 128)
+        vae_bn_std_seq = vae_bn_std.reshape(1, 1, 128)
+
+        latents_bn = latents_packed * vae_bn_std_seq + vae_bn_mean_seq
+        latents_unpacked = jnp.reshape(latents_bn, (batch_size_val, h_latent // 2, w_latent // 2, 32, 2, 2))
+        latents_unpacked = jnp.transpose(latents_unpacked, (0, 3, 1, 4, 2, 5))
+        latents_unpacked = jnp.reshape(latents_unpacked, (batch_size_val, 32, h_latent, w_latent))
+
+        res = self.vae.apply({"params": v_params}, latents=latents_unpacked, method=self.vae.decode)
+        return FlaxDecoderOutput(sample=res.sample)
 
     if isinstance(self.transformer, nnx.Module):
       g, nnx_state, r = nnx.split(self.transformer, nnx.Param, ...)
@@ -157,8 +196,10 @@ class FlaxFlux2KleinPipeline(FlaxDiffusionPipeline):
             return_dict=True,
         )
 
-      @jax.jit
-      def fused_denoise_loop(t_params, latents, img_ids, prompt_embeds, txt_ids, vec, timesteps, sigmas, guidance):
+      @jax.jit(static_argnums=(9,))
+      def fused_denoise_loop(
+          t_params, latents, img_ids, prompt_embeds, txt_ids, vec, timesteps, sigmas, guidance, target_len=None
+      ):
         sigmas_padded = jnp.concatenate([sigmas, jnp.array([0.0], dtype=sigmas.dtype)])
         nnx_merged = nnx.merge(g, t_params, r)
 
@@ -177,7 +218,15 @@ class FlaxFlux2KleinPipeline(FlaxDiffusionPipeline):
           )
           sigma = sigmas_padded[step_idx]
           sigma_next = sigmas_padded[step_idx + 1]
-          prev_sample = cur_latents + model_output.sample * (sigma_next - sigma)
+          dt = sigma_next - sigma
+          v = model_output.sample
+          if target_len is not None and cur_latents.shape[1] > target_len:
+            target_latents = cur_latents[:, :target_len, :]
+            v_target = v[:, :target_len, :]
+            next_target = target_latents + v_target * dt
+            prev_sample = jnp.concatenate([next_target, cur_latents[:, target_len:, :]], axis=1)
+          else:
+            prev_sample = cur_latents + v * dt
           return prev_sample, None
 
         steps = jnp.arange(timesteps.shape[0])
@@ -199,8 +248,10 @@ class FlaxFlux2KleinPipeline(FlaxDiffusionPipeline):
             guidance=guidance,
         )
 
-      @jax.jit
-      def fused_denoise_loop(t_params, latents, img_ids, prompt_embeds, txt_ids, vec, timesteps, sigmas, guidance):
+      @jax.jit(static_argnums=(9,))
+      def fused_denoise_loop(
+          t_params, latents, img_ids, prompt_embeds, txt_ids, vec, timesteps, sigmas, guidance, target_len=None
+      ):
         sigmas_padded = jnp.concatenate([sigmas, jnp.array([0.0], dtype=sigmas.dtype)])
 
         def scan_body(cur_latents, step_idx):
@@ -218,7 +269,15 @@ class FlaxFlux2KleinPipeline(FlaxDiffusionPipeline):
           )
           sigma = sigmas_padded[step_idx]
           sigma_next = sigmas_padded[step_idx + 1]
-          prev_sample = cur_latents + model_output.sample * (sigma_next - sigma)
+          dt = sigma_next - sigma
+          v = model_output.sample
+          if target_len is not None and cur_latents.shape[1] > target_len:
+            target_latents = cur_latents[:, :target_len, :]
+            v_target = v[:, :target_len, :]
+            next_target = target_latents + v_target * dt
+            prev_sample = jnp.concatenate([next_target, cur_latents[:, target_len:, :]], axis=1)
+          else:
+            prev_sample = cur_latents + v * dt
           return prev_sample, None
 
         steps = jnp.arange(timesteps.shape[0])
@@ -228,7 +287,48 @@ class FlaxFlux2KleinPipeline(FlaxDiffusionPipeline):
     self._jitted_qwen3_forward = qwen3_forward
     self._jitted_transformer_step = transformer_step
     self._jitted_fused_denoise_loop = fused_denoise_loop
+    self._jitted_vae_encode = vae_encode
     self._jitted_vae_decode = vae_decode
+
+  @staticmethod
+  def preprocess_reference_image(
+      image: Image.Image,
+      max_area: int = 1024 * 1024,
+      multiple_of: int = 16,
+  ) -> np.ndarray:
+    """Validates and preprocesses a single PIL reference image into BCHW [-1, 1] array."""
+    if not isinstance(image, Image.Image):
+      raise TypeError(f"Expected PIL.Image.Image for reference image, got {type(image)}")
+
+    width, height = image.size
+    if width < 64 or height < 64:
+      raise ValueError(f"Image too small: {width}x{height}. Both dimensions must be at least 64px")
+    aspect_ratio = max(width / height, height / width)
+    if aspect_ratio > 8.0:
+      raise ValueError(f"Aspect ratio too extreme: {width}x{height} (ratio: {aspect_ratio:.1f}:1 > 8:1)")
+
+    if image.mode != "RGB":
+      image = image.convert("RGB")
+
+    if width * height > max_area:
+      scale = math.sqrt(max_area / (width * height))
+      width = int(width * scale)
+      height = int(height * scale)
+      image = image.resize((width, height), Image.Resampling.LANCZOS)
+      width, height = image.size
+
+    target_w = (width // multiple_of) * multiple_of
+    target_h = (height // multiple_of) * multiple_of
+
+    left = (width - target_w) // 2
+    top = (height - target_h) // 2
+    right = left + target_w
+    bottom = top + target_h
+    image = image.crop((left, top, right, bottom))
+
+    arr = np.asarray(image, dtype=np.float32) / 127.5 - 1.0
+    arr = np.transpose(arr, (2, 0, 1))  # (3, H, W)
+    return np.expand_dims(arr, axis=0)  # (1, 3, H, W)
 
   def _get_dynamic_batch_sharding(self):
     """Dynamically infers the batch dimension sharding specification from self.mesh."""
@@ -237,25 +337,53 @@ class FlaxFlux2KleinPipeline(FlaxDiffusionPipeline):
     return jax.sharding.NamedSharding(self.mesh, spec)
 
   def compile_aot_async(
-      self, params, vae_params, qwen3_params, vae_bn_mean, vae_bn_std, batch_size=1, height=1024, width=1024
+      self,
+      params,
+      vae_params,
+      qwen3_params,
+      vae_bn_mean,
+      vae_bn_std,
+      batch_size=1,
+      height=1024,
+      width=1024,
+      images=None,
+      image=None,
+      num_conditioning_images=0,
   ):
     """Triggers AOT compilation for Qwen3, Flux Transformer, and VAE concurrently using ThreadPoolExecutor."""
     self._setup_jit_functions()
-    max_logging.log("🚀 Pre-compiling XLA graphs for Qwen3, Flux Transformer, and VAE concurrently...")
-    from concurrent.futures import ThreadPoolExecutor
+    max_logging.log("Pre-compiling XLA graphs for Qwen3, Flux Transformer, and VAE concurrently...")
+
+    if images is None and image is not None:
+      images = image if isinstance(image, list) else [image]
 
     seq_len_img = (height // 16) * (width // 16)
+    total_ref_tokens = 0
+    ref_shapes = []
+    if images is not None and len(images) > 0:
+      for img in images:
+        prep_arr = self.preprocess_reference_image(img)
+        target_h, target_w = prep_arr.shape[2], prep_arr.shape[3]
+        ref_shapes.append((target_h, target_w))
+        total_ref_tokens += (target_h // 16) * (target_w // 16)
+      num_conditioning_images = len(images)
+    elif num_conditioning_images > 0:
+      # If num_conditioning_images specified without images, assume default output size
+      total_ref_tokens = num_conditioning_images * seq_len_img
+
+    total_img_len = seq_len_img + total_ref_tokens
     seq_len_txt = self._config.max_sequence_length
 
     dummy_ids = jnp.zeros((batch_size, seq_len_txt), dtype=jnp.int32)
     dummy_mask = jnp.ones((batch_size, seq_len_txt), dtype=jnp.int32)
 
-    dummy_latents = jnp.zeros((batch_size, seq_len_img, 128), dtype=jnp.float32)
-    dummy_img_ids = jnp.zeros((batch_size, seq_len_img, 4), dtype=jnp.int32)
+    dummy_latents = jnp.zeros((batch_size, total_img_len, 128), dtype=jnp.float32)
+    dummy_img_ids = jnp.zeros((batch_size, total_img_len, 4), dtype=jnp.int32)
     dummy_prompt_embeds = jnp.zeros((batch_size, seq_len_txt, self.transformer.joint_attention_dim), dtype=jnp.bfloat16)
     dummy_txt_ids = jnp.zeros((batch_size, seq_len_txt, 4), dtype=jnp.float32)
     dummy_t_vec = jnp.zeros((batch_size,), dtype=jnp.float32)
 
+    dummy_target_latents = jnp.zeros((batch_size, seq_len_img, 128), dtype=jnp.float32)
     dummy_bn_mean = jnp.array(vae_bn_mean, dtype=jnp.float32)
     dummy_bn_std = jnp.array(vae_bn_std, dtype=jnp.float32)
 
@@ -277,6 +405,7 @@ class FlaxFlux2KleinPipeline(FlaxDiffusionPipeline):
     dummy_prompt_embeds = put_data_on_devices(dummy_prompt_embeds, context_sharding)
     dummy_txt_ids = put_data_on_devices(dummy_txt_ids, data_sharding)
     dummy_t_vec = put_data_on_devices(dummy_t_vec, data_sharding)
+    dummy_target_latents = put_data_on_devices(dummy_target_latents, data_sharding)
     dummy_bn_mean = put_data_on_devices(dummy_bn_mean, replicated_sharding)
     dummy_bn_std = put_data_on_devices(dummy_bn_std, replicated_sharding)
 
@@ -286,9 +415,9 @@ class FlaxFlux2KleinPipeline(FlaxDiffusionPipeline):
         self._jitted_qwen3_forward.lower(qwen3_params, dummy_ids, dummy_mask).compile()
       max_logging.log(f" -> [AOT COMPILED] Qwen3 Text Encoder in {time.perf_counter() - t0:.2f}s")
 
-    num_steps = getattr(self._config, "num_inference_steps", 4)
+    num_steps = self._config.num_inference_steps
     dummy_timesteps = put_data_on_devices(jnp.zeros((num_steps,), dtype=jnp.float32), replicated_sharding)
-    dummy_sigmas = put_data_on_devices(jnp.zeros((num_steps + 1,), dtype=jnp.float32), replicated_sharding)
+    dummy_sigmas = put_data_on_devices(jnp.zeros((num_steps,), dtype=jnp.float32), replicated_sharding)
 
     def compile_transformer():
       t0 = time.perf_counter()
@@ -303,26 +432,37 @@ class FlaxFlux2KleinPipeline(FlaxDiffusionPipeline):
             dummy_timesteps,
             dummy_sigmas,
             None,
+            seq_len_img,
         ).compile()
       max_logging.log(f" -> [AOT COMPILED] Fused Flux Transformer Denoise Scan in {time.perf_counter() - t0:.2f}s")
 
     def compile_vae():
       t0 = time.perf_counter()
       with self.mesh, nn_partitioning.axis_rules(self._config.logical_axis_rules):
-        self._jitted_vae_decode.lower(vae_params, dummy_latents, dummy_bn_mean, dummy_bn_std, height, width).compile()
+        self._jitted_vae_decode.lower(vae_params, dummy_target_latents, dummy_bn_mean, dummy_bn_std, height, width).compile()
       max_logging.log(f" -> [AOT COMPILED] VAE Decoder in {time.perf_counter() - t0:.2f}s")
 
+    def compile_vae_encode():
+      t0 = time.perf_counter()
+      enc_h, enc_w = ref_shapes[0] if ref_shapes else (height, width)
+      dummy_rgb = jnp.zeros((1, 3, enc_h, enc_w), dtype=jnp.float32)
+      with self.mesh, nn_partitioning.axis_rules(self._config.logical_axis_rules):
+        self._jitted_vae_encode.lower(vae_params, dummy_rgb).compile()
+      max_logging.log(f" -> [AOT COMPILED] VAE Encoder in {time.perf_counter() - t0:.2f}s")
+
     t_start = time.perf_counter()
-    with ThreadPoolExecutor(max_workers=3) as executor:
+    with ThreadPoolExecutor(max_workers=4) as executor:
       futures = [
           executor.submit(compile_qwen3),
           executor.submit(compile_transformer),
           executor.submit(compile_vae),
       ]
+      if num_conditioning_images > 0 or (images is not None and len(images) > 0):
+        futures.append(executor.submit(compile_vae_encode))
       for future in futures:
         future.result()
     aot_duration = time.perf_counter() - t_start
-    max_logging.log(f"⚡ [AOT CONCURRENT COMPILATION COMPLETE] Total AOT compile time: {aot_duration:.2f}s")
+    max_logging.log(f"[AOT CONCURRENT COMPILATION COMPLETE] Total AOT compile time: {aot_duration:.2f}s")
     return aot_duration
 
   def _prepare_latents(self, config, batch_size, height, width):
@@ -331,7 +471,7 @@ class FlaxFlux2KleinPipeline(FlaxDiffusionPipeline):
     latent_width = width // 8
     latent_shape = (batch_size, num_channels_latents, latent_height, latent_width)
 
-    seed_val = getattr(config, "seed", None)
+    seed_val = config.seed
     if seed_val is None:
       seed_val = int(time.time()) & 0x7FFFFFFF
     max_logging.log(
@@ -364,16 +504,30 @@ class FlaxFlux2KleinPipeline(FlaxDiffusionPipeline):
       width: int = 1024,
       num_inference_steps: int = 4,
       batch_size: int = 1,
+      images: Optional[List[Any]] = None,
+      image: Optional[Union[Any, List[Any]]] = None,
       use_latents: bool = False,
       latents: Optional[Any] = None,
       measure_time: bool = False,
+      timing: bool = False,
       warmup: bool = False,
       output_dir: str = "output/",
       output_name: str = "flux2klein_generated_image.png",
       profile_target: Optional[str] = None,
   ):
+    timing = timing or measure_time
     # 1. Setup JIT functions
     self._setup_jit_functions()
+
+    if images is None and image is not None:
+      images = image if isinstance(image, list) else [image]
+
+    if images is not None:
+      if not isinstance(images, (list, tuple)):
+        raise TypeError(f"Expected reference images to be a list/tuple of PIL.Image.Image, got {type(images)}")
+      for idx, img in enumerate(images):
+        if not isinstance(img, Image.Image):
+          raise TypeError(f"Expected reference image at index {idx} to be PIL.Image.Image, got {type(img)}")
 
     # 2. Setup prompts and inputs
     if isinstance(prompt, str):
@@ -401,7 +555,9 @@ class FlaxFlux2KleinPipeline(FlaxDiffusionPipeline):
 
     # RoPE position IDs
     txt_ids_val = prepare_text_ids(batch_size, seq_len_txt)
-    img_ids_val = prepare_latent_image_ids(batch_size, height // 16, width // 16)
+    target_img_ids_val = prepare_latent_image_ids(batch_size, height // 16, width // 16)
+    t_pipeline_start = time.perf_counter()
+    trace = {}
 
     # Scheduler
     mu = compute_empirical_mu(seq_len_img, num_inference_steps)
@@ -413,9 +569,6 @@ class FlaxFlux2KleinPipeline(FlaxDiffusionPipeline):
         shift=mu,
         sigmas=sigmas_custom,
     )
-
-    t_pipeline_start = time.perf_counter()
-    trace = {}
 
     with self.mesh, nn_partitioning.axis_rules(self._config.logical_axis_rules):
       proc_id = jax.process_index()
@@ -432,9 +585,61 @@ class FlaxFlux2KleinPipeline(FlaxDiffusionPipeline):
           return jax.device_put(x, sharding)
         return device_put_replicated(x, sharding)
 
-      t0_qwen3_start = time.perf_counter()
-      trace["start_to_qwen3"] = t0_qwen3_start - t_pipeline_start
-      max_logging.log(f" -> [TIMING] Start to Qwen3: {trace['start_to_qwen3']:.4f} seconds ⏱️")
+      # ---------------------------------------------------------------------
+      # PHASE 0: Encode Reference Images (VAE)
+      # ---------------------------------------------------------------------
+      if images is not None and len(images) > 0:
+        t0_vae_enc_start = time.perf_counter() if timing else 0.0
+        if timing:
+          trace["start_to_vae_encode"] = t0_vae_enc_start - t_pipeline_start
+        max_logging.log(f"{host_prefix} [PHASE 0] Encoding {len(images)} reference image(s) using JAX VAE encoder on TPU...")
+        norm_ref_latents = []
+        packed_ref_latents = []
+        bn_mean_arr = jnp.array(vae_bn_mean, dtype=jnp.float32)
+        bn_std_arr = jnp.array(vae_bn_std, dtype=jnp.float32)
+
+        for img in images:
+          img_np = self.preprocess_reference_image(img)
+          img_tensor = jnp.array(img_np, dtype=jnp.float32)
+
+          raw_ref_latents = self._jitted_vae_encode(vae_params, img_tensor)
+          patchified_ref = patchify_latents(raw_ref_latents)
+          normalized_ref = (patchified_ref - bn_mean_arr) / bn_std_arr
+          norm_ref_latents.append(normalized_ref)
+
+          packed = jnp.transpose(
+              jnp.reshape(normalized_ref, (normalized_ref.shape[0], normalized_ref.shape[1], -1)), (0, 2, 1)
+          )
+          if packed.shape[0] == 1 and batch_size > 1:
+            packed = jnp.repeat(packed, batch_size, axis=0)
+          packed_ref_latents.append(packed)
+
+        ref_img_ids_val = prepare_multi_image_ids(norm_ref_latents, scale=10)
+        if ref_img_ids_val.shape[0] == 1 and batch_size > 1:
+          ref_img_ids_val = jnp.repeat(ref_img_ids_val, batch_size, axis=0)
+        img_ids_val = jnp.concatenate([target_img_ids_val, ref_img_ids_val], axis=1)
+        latents_jax = jnp.concatenate([latents_jax] + packed_ref_latents, axis=1)
+        max_logging.log(f"  [PIPELINE] Joint latents shape: {latents_jax.shape}, Joint img_ids shape: {img_ids_val.shape}")
+
+        if timing:
+          latents_jax.block_until_ready()
+          t0_vae_enc_end = time.perf_counter()
+          trace["vae_encode"] = t0_vae_enc_end - t0_vae_enc_start
+          trace["image_encoding"] = trace["vae_encode"]
+          max_logging.log(f" -> [TIMING] Reference Image Encoding (VAE): {trace['vae_encode']:.4f} seconds")
+      else:
+        img_ids_val = target_img_ids_val
+        trace["vae_encode"] = 0.0
+        trace["image_encoding"] = 0.0
+
+      t0_qwen3_start = time.perf_counter() if timing else 0.0
+      if timing:
+        if trace.get("vae_encode", 0.0) > 0:
+          trace["vae_encode_to_qwen3"] = t0_qwen3_start - t0_vae_enc_end
+          max_logging.log(f" -> [TIMING] VAE Encode to Qwen3 Overhead: {trace['vae_encode_to_qwen3']:.4f} seconds")
+        else:
+          trace["start_to_qwen3"] = t0_qwen3_start - t_pipeline_start
+          max_logging.log(f" -> [TIMING] Start to Qwen3: {trace['start_to_qwen3']:.4f} seconds")
 
       # ---------------------------------------------------------------------
       # PHASE A: Encode Prompt (Qwen3)
@@ -446,41 +651,43 @@ class FlaxFlux2KleinPipeline(FlaxDiffusionPipeline):
 
       max_logging.log(f"{host_prefix} [PHASE A] Encoding {len(prompts)} prompt(s) using JAX Qwen3 on TPU...")
 
-      try:
-        # Tokenize using deterministic explicit template string (version-agnostic across transformers versions)
+      if hasattr(self.tokenizer, "apply_chat_template"):
         templated_texts = [
-            f"<|im_start|>user\n{p}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n" for p in prompts
+            self.tokenizer.apply_chat_template(
+                [{"role": "user", "content": p}],
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False,
+            )
+            for p in prompts
         ]
-        inputs = self.tokenizer(
-            templated_texts, return_tensors="np", padding="max_length", truncation=True, max_length=seq_len_txt
-        )
-        prompt_ids = jnp.array(inputs["input_ids"])
-        prompt_mask = jnp.array(inputs["attention_mask"])
+      else:
+        templated_texts = [f"<|im_start|>user\n{p}<|im_end|>\n<|im_start|>assistant\n" for p in prompts]
+      inputs = self.tokenizer(
+          templated_texts, return_tensors="np", padding="max_length", truncation=True, max_length=seq_len_txt
+      )
+      prompt_ids = jnp.array(inputs["input_ids"])
+      prompt_mask = jnp.array(inputs["attention_mask"])
 
-        # Run Text Encoding with sharded input arrays matching compile_aot_async
-        prompt_ids = put_data_on_devices(prompt_ids, data_sharding)
-        prompt_mask = put_data_on_devices(prompt_mask, data_sharding)
-        do_prof_qwen3 = profile_target in ("all", "qwen3")
-        if do_prof_qwen3:
-          tb_dir = getattr(self._config, "tensorboard_dir", "/tmp")
-          jax.profiler.start_trace(os.path.join(tb_dir, "profile_qwen3"))
-        with jax.named_scope("qwen3_text_encoder"):
-          prompt_embeds_jax = self._jitted_qwen3_forward(qwen3_params, prompt_ids, prompt_mask)
+      # Run Text Encoding with sharded input arrays matching compile_aot_async
+      prompt_ids = put_data_on_devices(prompt_ids, data_sharding)
+      prompt_mask = put_data_on_devices(prompt_mask, data_sharding)
+      do_prof_qwen3 = profile_target in ("all", "qwen3")
+      if do_prof_qwen3:
+        tb_dir = self._config.tensorboard_dir
+        jax.profiler.start_trace(os.path.join(tb_dir, "profile_qwen3"))
+      with jax.named_scope("qwen3_text_encoder"):
+        prompt_embeds_jax = self._jitted_qwen3_forward(qwen3_params, prompt_ids, prompt_mask)
+      if timing:
         prompt_embeds_jax.block_until_ready()
-        if do_prof_qwen3:
-          jax.profiler.stop_trace()
-      except Exception as e:
-        max_logging.log(f"❌ {host_prefix} EXCEPTION IN PHASE A (QWEN3 ENCODING): {e}")
-        import traceback
+      if do_prof_qwen3:
+        jax.profiler.stop_trace()
 
-        traceback.print_exc()
-        sys.stdout.flush()
-        raise e
-
-      t0_qwen3_end = time.perf_counter()
-      trace["qwen3_encoding"] = t0_qwen3_end - t0_qwen3_start
-      trace["prompt_encoding"] = trace["qwen3_encoding"]
-      max_logging.log(f" -> [TIMING] Prompt Encoding (Qwen3): {trace['qwen3_encoding']:.4f} seconds ⏱️")
+      if timing:
+        t0_qwen3_end = time.perf_counter()
+        trace["qwen3_encoding"] = t0_qwen3_end - t0_qwen3_start
+        trace["prompt_encoding"] = trace["qwen3_encoding"]
+        max_logging.log(f" -> [TIMING] Prompt Encoding (Qwen3): {trace['qwen3_encoding']:.4f} seconds")
 
       proc_id = jax.process_index()
       proc_cnt = jax.process_count()
@@ -488,7 +695,7 @@ class FlaxFlux2KleinPipeline(FlaxDiffusionPipeline):
 
       # Stage Sync 1: Phase A Complete
       multihost_utils.sync_global_devices("phase_a_complete")
-      max_logging.log(f"{host_prefix} Passed Phase A Sync Barrier (phase_a_complete) successfully! ✅")
+      max_logging.log(f"{host_prefix} Passed Phase A Sync Barrier (phase_a_complete) successfully!")
 
       latents_jax = put_data_on_devices(latents_jax, data_sharding)
       context_spec = P(None, "context") if "context" in self.mesh.axis_names and self.mesh.shape["context"] > 1 else P()
@@ -499,19 +706,20 @@ class FlaxFlux2KleinPipeline(FlaxDiffusionPipeline):
 
       max_logging.log(
           f"{host_prefix} DIAGNOSTIC TENSORS BEFORE PHASE B:\n"
-          f"  latents_jax: shape={latents_jax.shape}, dtype={latents_jax.dtype}, sharding={getattr(latents_jax, 'sharding', None)}\n"
-          f"  prompt_embeds_jax: shape={prompt_embeds_jax.shape}, dtype={prompt_embeds_jax.dtype}, sharding={getattr(prompt_embeds_jax, 'sharding', None)}\n"
-          f"  txt_ids_val: shape={txt_ids_val.shape}, dtype={txt_ids_val.dtype}, sharding={getattr(txt_ids_val, 'sharding', None)}\n"
-          f"  img_ids_val: shape={img_ids_val.shape}, dtype={img_ids_val.dtype}, sharding={getattr(img_ids_val, 'sharding', None)}"
+          f"  latents_jax: shape={latents_jax.shape}, dtype={latents_jax.dtype}, sharding={latents_jax.sharding}\n"
+          f"  prompt_embeds_jax: shape={prompt_embeds_jax.shape}, dtype={prompt_embeds_jax.dtype}, sharding={prompt_embeds_jax.sharding}\n"
+          f"  txt_ids_val: shape={txt_ids_val.shape}, dtype={txt_ids_val.dtype}, sharding={txt_ids_val.sharding}\n"
+          f"  img_ids_val: shape={img_ids_val.shape}, dtype={img_ids_val.dtype}, sharding={img_ids_val.sharding}"
       )
 
       # Stage Sync 2: Pre-Phase B Start
       multihost_utils.sync_global_devices("pre_phase_b_start")
-      max_logging.log(f"{host_prefix} Passed Pre-Phase B Sync Barrier (pre_phase_b_start) successfully! ✅")
+      max_logging.log(f"{host_prefix} Passed Pre-Phase B Sync Barrier (pre_phase_b_start) successfully!")
 
-      t0_denoise_start = time.perf_counter()
-      trace["qwen3_to_denoise"] = t0_denoise_start - t0_qwen3_end
-      max_logging.log(f" -> [TIMING] Qwen3 to Denoising Overhead: {trace['qwen3_to_denoise']:.4f} seconds ⏱️")
+      t0_denoise_start = time.perf_counter() if timing else 0.0
+      if timing:
+        trace["qwen3_to_denoise"] = t0_denoise_start - t0_qwen3_end
+        max_logging.log(f" -> [TIMING] Qwen3 to Denoising Overhead: {trace['qwen3_to_denoise']:.4f} seconds")
 
       # ---------------------------------------------------------------------
       # PHASE B: Denoising Loop (Flux Transformer - Standalone Step JIT)
@@ -521,53 +729,51 @@ class FlaxFlux2KleinPipeline(FlaxDiffusionPipeline):
           f"{host_prefix} [PHASE B] Running fused {steps_to_run}-step E2E Denoising Loop Scan on a batch of {batch_size} images (warmup={warmup})..."
       )
 
-      try:
-        guidance_vec_val = None
-        vec_val = None
-        replicated_sharding = jax.sharding.NamedSharding(self.mesh, P())
-        timesteps_device = put_data_on_devices(scheduler_state.timesteps, replicated_sharding)
-        sigmas_device = put_data_on_devices(scheduler_state.sigmas, replicated_sharding)
+      guidance_vec_val = None
+      vec_val = None
+      replicated_sharding = jax.sharding.NamedSharding(self.mesh, P())
+      timesteps_device = put_data_on_devices(scheduler_state.timesteps, replicated_sharding)
+      sigmas_device = put_data_on_devices(scheduler_state.sigmas, replicated_sharding)
 
-        do_prof_denoise = profile_target in ("all", "denoise")
-        if do_prof_denoise:
-          tb_dir = getattr(self._config, "tensorboard_dir", "/tmp")
-          jax.profiler.start_trace(os.path.join(tb_dir, "profile_denoise"))
-        with jax.named_scope("fused_flux_denoise_loop"):
-          latents_jax = self._jitted_fused_denoise_loop(
-              params,
-              latents_jax,
-              img_ids_val,
-              prompt_embeds_jax,
-              txt_ids_val,
-              vec_val,
-              timesteps_device,
-              sigmas_device,
-              guidance_vec_val,
-          )
+      do_prof_denoise = profile_target in ("all", "denoise")
+      if do_prof_denoise:
+        tb_dir = self._config.tensorboard_dir
+        jax.profiler.start_trace(os.path.join(tb_dir, "profile_denoise"))
+      with jax.named_scope("fused_flux_denoise_loop"):
+        latents_jax = self._jitted_fused_denoise_loop(
+            params,
+            latents_jax,
+            img_ids_val,
+            prompt_embeds_jax,
+            txt_ids_val,
+            vec_val,
+            timesteps_device,
+            sigmas_device,
+            guidance_vec_val,
+            seq_len_img,
+        )
+        if timing:
           latents_jax.block_until_ready()
-        if do_prof_denoise:
-          jax.profiler.stop_trace()
-
-      except Exception as e:
-        max_logging.log(f"❌ {host_prefix} EXCEPTION IN DENOISE LOOP: {e}")
-        import traceback
-
-        traceback.print_exc()
-        sys.stdout.flush()
-        raise e
+      if do_prof_denoise:
+        jax.profiler.stop_trace()
 
       # Stage Sync 3: Phase B Complete
       multihost_utils.sync_global_devices("phase_b_complete")
-      max_logging.log(f"{host_prefix} Passed Phase B Sync Barrier (phase_b_complete) successfully! ✅")
+      max_logging.log(f"{host_prefix} Passed Phase B Sync Barrier (phase_b_complete) successfully!")
 
-      t0_denoise_end = time.perf_counter()
-      trace["denoise_loop"] = t0_denoise_end - t0_denoise_start
-      max_logging.log(f" -> [TIMING] Denoising Loop (Flux): {trace['denoise_loop']:.4f} seconds ⏱️")
+      if timing:
+        t0_denoise_end = time.perf_counter()
+        trace["denoise_loop"] = t0_denoise_end - t0_denoise_start
+        max_logging.log(f" -> [TIMING] Denoising Loop (Flux): {trace['denoise_loop']:.4f} seconds")
 
     # ---------------------------------------------------------------------
     # PHASE C: Decode Latents (VAE Decoder)
     # ---------------------------------------------------------------------
     max_logging.log("[PHASE C] Decoding final latents to RGB image using JAX VAE decoder on TPU...")
+
+    # Slice target latents from joint latents if reference images were present
+    if latents_jax.shape[1] > seq_len_img:
+      latents_jax = latents_jax[:, :seq_len_img, :]
 
     # Decode VAE latents to RGB pixels using fused JIT vae_decode
     data_sharding = self._get_dynamic_batch_sharding()
@@ -576,13 +782,14 @@ class FlaxFlux2KleinPipeline(FlaxDiffusionPipeline):
     vae_bn_mean_jax = put_data_on_devices(jnp.array(vae_bn_mean, dtype=jnp.float32), replicated_sharding)
     vae_bn_std_jax = put_data_on_devices(jnp.array(vae_bn_std, dtype=jnp.float32), replicated_sharding)
 
-    t0_vae_start = time.perf_counter()
-    trace["denoise_to_vae"] = t0_vae_start - t0_denoise_end
-    max_logging.log(f" -> [TIMING] Denoising to VAE Overhead: {trace['denoise_to_vae']:.4f} seconds ⏱️")
+    t0_vae_start = time.perf_counter() if timing else 0.0
+    if timing:
+      trace["denoise_to_vae"] = t0_vae_start - t0_denoise_end
+      max_logging.log(f" -> [TIMING] Denoising to VAE Overhead: {trace['denoise_to_vae']:.4f} seconds")
 
     do_prof_vae = profile_target in ("all", "vae")
     if do_prof_vae:
-      tb_dir = getattr(self._config, "tensorboard_dir", "/tmp")
+      tb_dir = self._config.tensorboard_dir
       jax.profiler.start_trace(os.path.join(tb_dir, "profile_vae"))
     with jax.named_scope("vae_decoder"):
       decoded_out = self._jitted_vae_decode(vae_params, latents_jax, vae_bn_mean_jax, vae_bn_std_jax, height, width)
@@ -591,9 +798,10 @@ class FlaxFlux2KleinPipeline(FlaxDiffusionPipeline):
     if do_prof_vae:
       jax.profiler.stop_trace()
 
-    t0_vae_end = time.perf_counter()
-    trace["vae_decode"] = t0_vae_end - t0_vae_start
-    max_logging.log(f" -> [TIMING] VAE Decoding: {trace['vae_decode']:.4f} seconds ⏱️")
+    if timing:
+      t0_vae_end = time.perf_counter()
+      trace["vae_decode"] = t0_vae_end - t0_vae_start
+      max_logging.log(f" -> [TIMING] VAE Decoding: {trace['vae_decode']:.4f} seconds")
 
     # ---------------------------------------------------------------------
     # POST-PROCESS: Format and Save Outputs
@@ -627,10 +835,11 @@ class FlaxFlux2KleinPipeline(FlaxDiffusionPipeline):
       saved_paths.append(output_png_path)
 
     t0_save_end = time.perf_counter()
-    trace["image_saving"] = t0_save_end - t0_vae_end
-    trace["e2e_pipeline_total"] = t0_save_end - t_pipeline_start
+    if timing:
+      trace["image_saving"] = t0_save_end - t0_vae_end
+      max_logging.log(f" -> [TIMING] Image Saving: {trace['image_saving']:.4f} seconds")
 
-    max_logging.log(f" -> [TIMING] Image Saving: {trace['image_saving']:.4f} seconds ⏱️")
-    max_logging.log(f" -> [TIMING] E2E Pipeline Total: {trace['e2e_pipeline_total']:.4f} seconds ⏱️")
+    trace["e2e_pipeline_total"] = t0_save_end - t_pipeline_start
+    max_logging.log(f" -> [TIMING] E2E Pipeline Total: {trace['e2e_pipeline_total']:.4f} seconds")
 
     return saved_paths, trace

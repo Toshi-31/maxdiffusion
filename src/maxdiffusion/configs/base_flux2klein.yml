@@ -20,7 +20,8 @@ metrics_file: "" # for testing, local file that stores scalar metrics. If empty,
 write_metrics: True
 
 timing_metrics_file: "" # for testing, local file that stores function timing metrics such as state creation, compilation. If empty, no metrics are written.
-write_timing_metrics: True 
+write_timing_metrics: False
+timing: False 
 
 gcs_metrics: False
 # If true save config to GCS in {base_output_directory}/{run_name}/
@@ -40,6 +41,8 @@ max_sequence_length: 512
 time_shift: True
 base_shift: 0.5
 max_shift: 1.15
+image_paths: []
+use_base2_exp: True
 
 
 unet_checkpoint: ''
