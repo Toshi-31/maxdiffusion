@@ -273,32 +273,50 @@ def _select_flash_block_sizes(
     flash_block_sizes: BlockSizes,
     dtype: jnp.dtype,
     attention_kernel: str,
+    preserve_asymmetric_block_sizes: bool = False,
 ) -> BlockSizes:
+  """Select Flash/Splash block sizes.
+
+  Existing MaxDiffusion behavior is preserved by default. When
+  preserve_asymmetric_block_sizes=True, explicitly configured block sizes are
+  honored even when Q and KV have different sequence lengths; the existing
+  padding path makes the tensors compatible with those block sizes.
+  """
   query_seq_len = _flash_sequence_length(query)
   key_seq_len = _flash_sequence_length(key)
 
   q_max_block_size = 1024 if dtype == jnp.bfloat16 else 512
+
   if key_seq_len != query_seq_len:
     kv_max_block_size = ((key_seq_len + 127) // 128) * 128
   else:
     kv_max_block_size = q_max_block_size
 
-  # Custom kernels use a lightweight carrier that omits the standard Splash
-  # backward fields. A remapped/local standard kernel still needs a complete
-  # BlockSizes object, including when cross-attention happens to have q_len ==
-  # kv_len.
+  # Preserve the existing Tokamax conversion behavior.
   if flash_block_sizes is not None and not hasattr(flash_block_sizes, "use_fused_bwd_kernel"):
     flash_block_sizes = _coerce_tokamax_block_sizes(flash_block_sizes)
 
-  # Keep configured block sizes for self-attention, but let
-  # cross-attention derive safe KV-aware sizes when q_len != kv_len.
-  if flash_block_sizes and key_seq_len == query_seq_len:
-    if attention_kernel in ["tokamax_flash", "tokamax_ring"]:
+  # Existing self-attention behavior: configured values are returned unchanged.
+  if flash_block_sizes is not None and key_seq_len == query_seq_len:
+    if attention_kernel in ("tokamax_flash", "tokamax_ring"):
       return _coerce_tokamax_block_sizes(flash_block_sizes)
     return flash_block_sizes
 
-  block_size_q = flash_block_sizes.block_q if flash_block_sizes else q_max_block_size
-  use_tokamax = attention_kernel in ["tokamax_flash", "tokamax_ring"]
+  # NEW: opt-in behavior required by Klein KV-cache.
+  #
+  # Q and KV may have different sequence lengths, but _pad_data_for_flash()
+  # pads each sequence independently to the configured block size. Therefore
+  # block_q/block_kv do not need to divide the original sequence lengths.
+  if preserve_asymmetric_block_sizes and flash_block_sizes is not None:
+    if attention_kernel in ("tokamax_flash", "tokamax_ring"):
+      return _coerce_tokamax_block_sizes(flash_block_sizes)
+    return flash_block_sizes
+
+  # Existing MaxDiffusion cross-attention behavior.
+  block_size_q = flash_block_sizes.block_q if flash_block_sizes is not None else q_max_block_size
+
+  use_tokamax = attention_kernel in ("tokamax_flash", "tokamax_ring")
+
   return splash_attention_kernel.BlockSizes(
       block_q=block_size_q,
       block_kv_compute=min(kv_max_block_size, key_seq_len),
@@ -308,7 +326,7 @@ def _select_flash_block_sizes(
       block_kv_dkv_compute=min(kv_max_block_size, query_seq_len),
       block_q_dq=None if use_tokamax else block_size_q,
       block_kv_dq=None if use_tokamax else min(kv_max_block_size, query_seq_len),
-      use_fused_bwd_kernel=True if use_tokamax else False,
+      use_fused_bwd_kernel=use_tokamax,
   )
 
 
@@ -577,6 +595,7 @@ def _tpu_flash_attention(
     use_base2_exp: bool = False,
     use_experimental_scheduler: bool = False,
     is_causal: bool = False,
+    preserve_asymmetric_block_sizes: bool = False,
 ) -> jax.Array:
   """TPU Flash Attention"""
 
@@ -587,7 +606,14 @@ def _tpu_flash_attention(
   attention_mask = _prepare_attention_mask_for_shard_map(attention_mask, query.shape[0], key.shape[2])
   if attention_mask is not None and attention_kernel == "tokamax_ring_custom":
     raise NotImplementedError("tokamax_ring_custom does not support attention_mask.")
-  block_sizes = _select_flash_block_sizes(query, key, flash_block_sizes, dtype, attention_kernel)
+  block_sizes = _select_flash_block_sizes(
+      query,
+      key,
+      flash_block_sizes,
+      dtype,
+      attention_kernel,
+      preserve_asymmetric_block_sizes=preserve_asymmetric_block_sizes,
+  )
 
   q_axis_names = nn.logical_to_mesh_axes(axis_names_q)
   kv_axis_names = nn.logical_to_mesh_axes(axis_names_kv)
@@ -832,6 +858,7 @@ def _ulysses_attention(
     use_experimental_scheduler: bool = False,
     use_fixed_m: bool = False,
     ulysses_attention_chunks: int = 1,
+    preserve_asymmetric_block_sizes: bool = False,
 ) -> jax.Array:
   """Ulysses sequence-parallel attention.
 
@@ -862,7 +889,14 @@ def _ulysses_attention(
     )
 
   if not use_custom_kernel:
-    block_sizes = _select_flash_block_sizes(query, key, flash_block_sizes, dtype, "flash")
+    block_sizes = _select_flash_block_sizes(
+        query,
+        key,
+        flash_block_sizes,
+        dtype,
+        "flash",
+        preserve_asymmetric_block_sizes=preserve_asymmetric_block_sizes,
+    )
 
   q_axis_names = nn.logical_to_mesh_axes(axis_names_q)
   kv_axis_names = nn.logical_to_mesh_axes(axis_names_kv)
@@ -1080,6 +1114,7 @@ def _ulysses_ring_attention(
     use_experimental_scheduler: bool = False,
     ulysses_shards: int = -1,
     ulysses_attention_chunks: int = 1,
+    preserve_asymmetric_block_sizes: bool = False,
 ) -> jax.Array:
   """2D context-parallel attention using a private Ulysses x ring mesh.
 
@@ -1124,7 +1159,14 @@ def _ulysses_ring_attention(
   attention_mask = _prepare_attention_mask_for_shard_map(attention_mask, query.shape[0], key.shape[2])
   num_heads = query.shape[1]
 
-  block_sizes = _select_flash_block_sizes(query, key, flash_block_sizes, dtype, "tokamax_ring")
+  block_sizes = _select_flash_block_sizes(
+      query,
+      key,
+      flash_block_sizes,
+      dtype,
+      "tokamax_ring",
+      preserve_asymmetric_block_sizes=preserve_asymmetric_block_sizes,
+  )
 
   q_axis_names = nn.logical_to_mesh_axes(axis_names_q)
   kv_axis_names = nn.logical_to_mesh_axes(axis_names_kv)
@@ -1751,6 +1793,7 @@ def ulysses_kernel(q, k, v, context):
       residual_checkpoint_name=context["residual_checkpoint_name"],
       attention_mask=context["attention_mask"],
       ulysses_attention_chunks=context["ulysses_attention_chunks"],
+      preserve_asymmetric_block_sizes=context.get("preserve_asymmetric_block_sizes", False),
   )
 
 
@@ -1773,6 +1816,7 @@ def ulysses_ring_kernel(q, k, v, context):
       use_experimental_scheduler=context["use_experimental_scheduler"],
       ulysses_shards=context["ulysses_shards"],
       ulysses_attention_chunks=context["ulysses_attention_chunks"],
+      preserve_asymmetric_block_sizes=context.get("preserve_asymmetric_block_sizes", False),
   )
 
 
@@ -1795,6 +1839,7 @@ def flash_kernel(q, k, v, context):
       use_base2_exp=context["use_base2_exp"],
       use_experimental_scheduler=context["use_experimental_scheduler"],
       is_causal=context.get("is_causal", False),
+      preserve_asymmetric_block_sizes=context.get("preserve_asymmetric_block_sizes", False),
   )
 
 
@@ -1817,6 +1862,7 @@ def tokamax_flash_kernel(q, k, v, context):
       use_base2_exp=context["use_base2_exp"],
       use_experimental_scheduler=context["use_experimental_scheduler"],
       is_causal=context.get("is_causal", False),
+      preserve_asymmetric_block_sizes=context.get("preserve_asymmetric_block_sizes", False),
   )
 
 
@@ -1839,6 +1885,7 @@ def tokamax_ring_kernel(q, k, v, context):
       use_base2_exp=context["use_base2_exp"],
       use_experimental_scheduler=context["use_experimental_scheduler"],
       is_causal=context.get("is_causal", False),
+      preserve_asymmetric_block_sizes=context.get("preserve_asymmetric_block_sizes", False),
   )
 
 
@@ -1859,6 +1906,7 @@ def tokamax_ring_custom_kernel(q, k, v, context):
       attention_mask=context["attention_mask"],
       use_base2_exp=context.get("use_base2_exp", True),
       use_experimental_scheduler=context.get("use_experimental_scheduler", False),
+      preserve_asymmetric_block_sizes=context.get("preserve_asymmetric_block_sizes", False),
   )
 
 
@@ -1893,6 +1941,7 @@ def _apply_attention(
     ulysses_shards: int = -1,
     ulysses_attention_chunks: int = 1,
     is_causal: bool = False,
+    preserve_asymmetric_block_sizes: bool = False,
 ):
   """Routes to different attention kernels using a module-level registry."""
 
@@ -1959,11 +2008,13 @@ def _apply_attention(
       "use_memory_efficient_attention": use_memory_efficient_attention,
       "dpa_layer": dpa_layer,
       "is_causal": is_causal,
+      "preserve_asymmetric_block_sizes": preserve_asymmetric_block_sizes,
   }
 
   # Module-level Registry lookup
   if effective_attention_kernel in KERNEL_REGISTRY:
-    return KERNEL_REGISTRY[effective_attention_kernel](query, key, value, context)
+    with jax.named_scope(f"kernel_{effective_attention_kernel}"):
+      return KERNEL_REGISTRY[effective_attention_kernel](query, key, value, context)
 
   raise ValueError(f"Unexpected attention kernel {effective_attention_kernel=}.")
 
@@ -2244,6 +2295,7 @@ class NNXAttentionOp(nnx.Module):
       key: Array,
       value: Array,
       attention_mask: Array = None,
+      preserve_asymmetric_block_sizes: bool = False,
   ):
     return _apply_attention(
         query=query,
@@ -2270,6 +2322,7 @@ class NNXAttentionOp(nnx.Module):
         use_experimental_scheduler=self.use_experimental_scheduler if hasattr(self, "use_experimental_scheduler") else False,
         ulysses_shards=(self.ulysses_shards if hasattr(self, "ulysses_shards") else -1),
         ulysses_attention_chunks=(self.ulysses_attention_chunks if hasattr(self, "ulysses_attention_chunks") else 1),
+        preserve_asymmetric_block_sizes=preserve_asymmetric_block_sizes,
     )
 
 
@@ -2318,7 +2371,14 @@ class AttentionOp(nn.Module):
       variables = {}
       self.dpa_layer = functools.partial(dpa_layer.apply, variables)
 
-  def apply_attention(self, query: Array, key: Array, value: Array, attention_mask: Array = None):
+  def apply_attention(
+      self,
+      query: Array,
+      key: Array,
+      value: Array,
+      attention_mask: Array = None,
+      preserve_asymmetric_block_sizes: bool = False,
+  ):
     return _apply_attention(
         query=query,
         key=key,
@@ -2343,6 +2403,7 @@ class AttentionOp(nn.Module):
         ulysses_shards=self.ulysses_shards,
         ulysses_attention_chunks=self.ulysses_attention_chunks,
         is_causal=self.is_causal,
+        preserve_asymmetric_block_sizes=preserve_asymmetric_block_sizes,
     )
 
 
