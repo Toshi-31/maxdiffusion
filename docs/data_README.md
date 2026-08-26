@@ -4,7 +4,7 @@
 Currently MaxDiffusion supports 3 data input pipelines, controlled by the flag `dataset_type`
 | Pipeline | Dataset Location | Dataset formats | Features or limitations |
 | -------- | ---------------- | --------------- | ----------------------- |
-| HuggingFace (hf) | datasets in HuggingFace Hub or local/Cloud Storage | Formats supported in HF Hub: parquet, arrow, json, csv, txt | data are not loaded in memory but streamed from the saved location, good for big dataset | 
+| HuggingFace (hf) | datasets in HuggingFace Hub or local/Cloud Storage | Formats supported in HF Hub: parquet, arrow, json, csv, txt | data are not loaded in memory but streamed from the saved location, good for big dataset |
 | tf | dataset will be downloaded form HuggingFace Hub to disk | Formats supported in HF Hub: parquet, arrow, json, csv, txt | Will read the whole dataset into memory, works for small dataset |
 | tfrecord | local/Cloud Storage | TFRecord | data are not loaded in memory but streamed from the saved location, good for big dataset |
 | Grain | local/Cloud Storage | ArrayRecord (or any random access format) | data are not loaded in memory but streamed from the saved location, good for big dataset, supports global shuffle and data iterator checkpoint for determinism (see details in [doc](https://github.com/AI-Hypercomputer/maxtext/blob/main/getting_started/Data_Input_Pipeline.md#grain-pipeline---for-determinism)) |
@@ -14,16 +14,16 @@ Currently MaxDiffusion supports 3 data input pipelines, controlled by the flag `
 ### HuggingFace Streaming (dataset_type=hf)
 #### Example config for streaming from HuggingFace Hub (no download needed):
 ```
-dataset_type: hf 
+dataset_type: hf
 dataset_name: BleachNick/UltraEdit_500k  # for using https://huggingface.co/datasets/BleachNick/UltraEdit_500k
-image_column: source_image 
-caption_column: source_caption 
+image_column: source_image
+caption_column: source_caption
 train_split: FreeForm
 hf_access_token: ''  # provide token if using gated dataset or tokenizer
 ```
 #### Example config for streaming from downloaded data in a GCS bucket:
 ```
-dataset_type: hf 
+dataset_type: hf
 dataset_name: parquet  # or json, arrow, etc.
 hf_train_files: gs://<bucket>/<folder>/*-train-*.parquet  # match the train files
 ```

@@ -15,7 +15,7 @@
 # limitations under the License.
 
 # Description:
-# DATASET_GCS_BUCKET and MOUNT_PATH are required，FILE_PATH is optional, if provided, 
+# DATASET_GCS_BUCKET and MOUNT_PATH are required，FILE_PATH is optional, if provided,
 # will use ls -R to improve first-time read performance by prefetching metadata
 # https://cloud.google.com/storage/docs/cloud-storage-fuse/performance#improve-first-time-reads
 # bash setup_gcsfuse.sh DATASET_GCS_BUCKET=maxdiffusion-github-runner-test-assets MOUNT_PATH=/tmp/gcsfuse FILE_PATH=/tmp/gcsfuse/my_dataset
@@ -52,7 +52,7 @@ gcsfuse -o ro --implicit-dirs --log-severity=debug \
         --type-cache-max-size-mb=-1 --stat-cache-max-size-mb=-1 --kernel-list-cache-ttl-secs=-1 --metadata-cache-ttl-secs=-1 \
         --log-file=$HOME/gcsfuse_$TIMESTAMP.json "$DATASET_GCS_BUCKET" "$MOUNT_PATH"
 
-if [[ ! -z ${FILE_PATH} ]] ; then 
+if [[ ! -z ${FILE_PATH} ]] ; then
   FILE_COUNT=$(ls -R $FILE_PATH | wc -l)
   echo $FILE_COUNT files found in $FILE_PATH
 fi

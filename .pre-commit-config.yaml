@@ -1,0 +1,35 @@
+# See https://pre-commit.com for more information
+# See https://pre-commit.com/hooks.html for more hooks
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: ^\.github/
+      - id: end-of-file-fixer
+        exclude: ^\.github/
+      - id: check-yaml
+      - id: check-added-large-files
+        args: ['--maxkb=5000']
+      - id: check-merge-conflict
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.9.9
+    hooks:
+      - id: ruff
+        args: [--fix]
+
+  - repo: https://github.com/google/pyink
+    rev: 23.10.0
+    hooks:
+      - id: pyink
+        args: ["--pyink-indentation=2", "--line-length=125"]
+
+  - repo: local
+    hooks:
+      - id: pylint
+        name: pylint
+        entry: pylint --fail-under=7
+        language: system
+        types: [python]
+        files: ^(src/maxdiffusion|end_to_end)/
