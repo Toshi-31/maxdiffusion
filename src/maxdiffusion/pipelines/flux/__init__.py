@@ -14,8 +14,22 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-_import_structure = {"pipeline_jflux": "JfluxPipeline"}
+from typing import TYPE_CHECKING
+from ...utils import DIFFUSERS_SLOW_IMPORT, _LazyModule
 
-from .flux_pipeline import (
-    FluxPipeline,
-)
+_import_structure = {
+    "flux_pipeline": ["FluxPipeline"],
+    "flux2klein_pipeline": ["FlaxFlux2KleinPipeline"],
+}
+
+if TYPE_CHECKING or DIFFUSERS_SLOW_IMPORT:
+  from .flux_pipeline import (
+      FluxPipeline,
+  )
+  from .flux2klein_pipeline import (
+      FlaxFlux2KleinPipeline,
+  )
+else:
+  import sys
+
+  sys.modules[__name__] = _LazyModule(__name__, globals()["__file__"], _import_structure, module_spec=__spec__)
