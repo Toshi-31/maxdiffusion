@@ -17,6 +17,7 @@
 [![Unit Tests](https://github.com/AI-Hypercomputer/maxdiffusion/actions/workflows/UnitTests.yml/badge.svg)](https://github.com/AI-Hypercomputer/maxdiffusion/actions/workflows/UnitTests.yml)
 
 # What's new?
+- **`2026/08/28`**: Flux2.Klein text to image and image editing (w/ KV Cache) is now supported.
 - **`2026/07/14`**: Automatic attention tile-size (`block_q`/`block_kv`) search for Wan is now supported.
 - **`2026/06/26`**: 2D ring (USP) attention with a custom splash kernel is now supported for Wan (`ulysses_ring_custom`), splitting context parallelism into an intra-chip Ulysses axis and a cross-chip ring axis.
 - **`2026/04/16`**: Support for Tokamax Ring Attention kernel is now added.
@@ -49,6 +50,7 @@ MaxDiffusion supports
 * Stable Diffusion 2.1 (training and inference)
 * Stable Diffusion XL (training and inference).
 * Flux Dev and Schnell (Training and inference).
+* Flux.2-Klein 4B & 9B (text-to-image and multi-image editing with KV-Cache).
 * Stable Diffusion Lightning (inference).
 * Hyper-SD XL LoRA loading (inference).
 * Load Multiple LoRA (SDXL inference).
@@ -761,6 +763,8 @@ The optimal attention tile sizes (`block_q` / `block_kv`) depend on the sequence
 
   Flux.2-Klein provides ultra-fast 4-step image generation using Qwen3 text embeddings and FLUX.2 transformer blocks.
 
+  #### Text-to-Image Generation:
+
   Flux.2-Klein 4B:
 
   ```bash
@@ -771,6 +775,22 @@ The optimal attention tile sizes (`block_q` / `block_kv`) depend on the sequence
 
   ```bash
   python src/maxdiffusion/generate_flux2klein.py src/maxdiffusion/configs/base_flux2klein_9B.yml run_name=flux2klein_9b prompt="A detailed vector illustration of a robotic hummingbird"
+  ```
+
+  #### Multi-Reference Image Editing:
+
+  Flux.2-Klein supports multi-reference image editing conditioned on up to 4 reference images via the `image_paths` CLI flag.
+
+  Flux.2-Klein 9B Image Editing:
+
+  ```bash
+  python src/maxdiffusion/generate_flux2klein.py src/maxdiffusion/configs/base_flux2klein_9B.yml run_name=flux2klein_9b_image_edit prompt="change the lighting to evening" image_paths="['src/maxdiffusion/tests/images/flux2klein/ref_flux2klein_9b.png']"
+  ```
+
+  The 9B model also supports KV-Cache for faster inference, and can be toggled with the `use_kv=True` CLI flag:
+
+  ```bash
+  python src/maxdiffusion/generate_flux2klein.py src/maxdiffusion/configs/base_flux2klein_9B.yml run_name=flux2klein_9b_kv_edit prompt="change the lighting to evening" image_paths="['src/maxdiffusion/tests/images/flux2klein/ref_flux2klein_9b.png']" use_kv=True
   ```
   ## Fused Attention for GPU:
   Fused Attention for GPU is supported via TransformerEngine. Installation instructions:

@@ -223,6 +223,17 @@ def main(argv):
   repo_id = config.pretrained_model_name_or_path
   if not repo_id:
     raise ValueError("pretrained_model_name_or_path must be specified in configuration YAML or CLI.")
+
+  use_kv = config.use_kv
+  if use_kv:
+    if repo_id in ("black-forest-labs/FLUX.2-klein-4B", "black-forest-labs/FLUX.2-klein-4b"):
+      max_logging.log("[WARNING] KV cache not supported for 4B model, ignoring use_kv=True.")
+      pyconfig._config.keys["use_kv"] = False
+    elif repo_id in ("black-forest-labs/FLUX.2-klein-9B", "black-forest-labs/FLUX.2-klein-9b"):
+      repo_id = "black-forest-labs/FLUX.2-klein-9b-kv"
+      pyconfig._config.keys["pretrained_model_name_or_path"] = repo_id
+      max_logging.log(f"[INFO] use_kv=True: switched pretrained_model_name_or_path to KV model variant: {repo_id}")
+
   max_logging.log(f"Target model detected: {repo_id}")
 
   if os.path.exists(repo_id):
