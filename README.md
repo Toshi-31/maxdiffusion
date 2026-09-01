@@ -183,7 +183,7 @@ After installation completes, run the training script.
   ```bash
   rm $TFRECORDS_DATASET_DIR/eval_timesteps/file_42-430.tfrec
   ```
-  
+
   ### Training on a Single VM
 
   Loading the data is supported both locally from the disk created above, or from `gcs`. In this guide, we'll be using a gcs bucket to train. First copy the data to the GCS bucket.
@@ -268,7 +268,7 @@ After installation completes, run the training script.
   - per_device_batch_size can be a fractional, but must be a whole number when multiplied by number of devices. In this example, 0.25 * 4 (devices) = effective global batch size = 1.
   - The step time in v5p-8 with global batch size = 1 is large due to using `FULL` remat. On larger number of chips we can run larger batch sizes greatly increasing MFU, as we will see in the next session of deploying with xpk.
   - To enable eval during training set `eval_every` to a value > 0.
-  - In Wan2.1, the ici_fsdp_parallelism axis is used for sequence parallelism, the ici_tensor_parallelism axis is used for head parallelism. 
+  - In Wan2.1, the ici_fsdp_parallelism axis is used for sequence parallelism, the ici_tensor_parallelism axis is used for head parallelism.
     - You can enable both, keeping in mind that Wan2.1 has 40 heads and 40 must be evenly divisible by ici_tensor_parallelism.
     - For Sequence parallelism, the code pads the sequence length to evenly divide the sequence. Try out different ici_fsdp_parallelism numbers, but we find 2 and 4 to be the best right now.
   - For use on GPU it is recommended to enable the cudnn_te_flash attention kernel for optimal performance.
@@ -311,7 +311,7 @@ After installation completes, run the training script.
   ### Deploying with XPK
 
   This assumes the user has already created an xpk cluster, installed all dependencies and the also created the dataset from the step above. For getting started with MaxDiffusion and xpk see [this guide](docs/getting_started/run_maxdiffusion_via_xpk.md).
-  
+
   Using v5p-256 Then the command to run on xpk is as follows:
 
   ```bash
@@ -525,8 +525,8 @@ To generate images, run the following command:
   ```bash
   python src/maxdiffusion/generate_ltx_video.py src/maxdiffusion/configs/ltx_video.yml output_dir="[SAME DIRECTORY]" config_path="src/maxdiffusion/models/ltx_video/ltxv-13B.json"
   ```
-  Img2video Generation: 
-  
+  Img2video Generation:
+
   Add conditioning image path as conditioning_media_paths in the form of ["IMAGE_PATH"] along with other generation parameters in the ltx_video.yml file. Then follow same instruction as above.
 
   ## LTX-2 Video
@@ -706,14 +706,14 @@ python src/maxdiffusion/generate_wan.py \
 ### Ring Attention
 We added ring attention support for Wan models. Below are the stats for one `720p` (81 frames) video generation (with CFG DP):
 | Accelerator |  Model | Attention Type | Inference Steps | Sharding | e2e Generation Time |
-| -- | -- | -- | -- | -- | -- | 
+| -- | -- | -- | -- | -- | -- |
 | v7x-8 | WAN 2.1 | Tokamax Flash | 50 | dp2-fsdp1-context4-tp1 | **249.3** |
 | v7x-8 | WAN 2.1 | Tokamax Ring | 50 | dp2-fsdp1-context4-tp1 | 252.4 |
 | v7x-8 | WAN 2.2 | Tokamax Flash | 40 | dp2-fsdp1-context4-tp1 | **194.4** |
 | v7x-8 | WAN 2.2 | Tokamax Ring | 40 | dp2-fsdp1-context4-tp1 | 201.7 |
 
 | Accelerator |  Model | Attention Type | Inference Steps | Sharding | e2e Generation Time |
-| -- | -- | -- | -- | -- | -- | 
+| -- | -- | -- | -- | -- | -- |
 | v7x-16 | WAN 2.1 | Tokamax Flash | 50 | dp2-fsdp1-context8-tp1 | **127.1** |
 | v7x-16 | WAN 2.1 | Tokamax Ring | 50 | dp2-fsdp1-context8-tp1 | 137.2 |
 | v7x-16 | WAN 2.2 | Tokamax Flash | 40 | dp2-fsdp1-context8-tp1 | **106.0** |
@@ -753,7 +753,7 @@ The optimal attention tile sizes (`block_q` / `block_kv`) depend on the sequence
 
   If you are using a TPU v6e (Trillium), you can use optimized flash block sizes for faster inference. Uncomment Flux-dev [config](src/maxdiffusion/configs/base_flux_dev.yml#60) and Flux-schnell [config](src/maxdiffusion/configs/base_flux_schnell.yml#68)
 
-  To keep text encoders, vae and transformer on HBM memory at all times, the following command shards the model across devices. 
+  To keep text encoders, vae and transformer on HBM memory at all times, the following command shards the model across devices.
 
   ```bash
   python src/maxdiffusion/generate_flux.py src/maxdiffusion/configs/base_flux_schnell.yml jax_cache_dir=/tmp/cache_dir run_name=flux_test output_dir=/tmp/ prompt="photograph of an electronics chip in the shape of a race car with trillium written on its side" per_device_batch_size=1 ici_data_parallelism=1 ici_fsdp_parallelism=-1 offload_encoders=False
@@ -920,13 +920,40 @@ MaxDiffusion started as a fork of [Diffusers](https://github.com/huggingface/dif
 Whether you are forking MaxDiffusion for your own needs or intending to contribute back to the community, a full suite of tests can be found in `tests` and `src/maxdiffusion/tests`.
 
 To run unit tests simply run:
-```
+```bash
 python -m pytest
 ```
 
+### Pre-commit Hooks
+
+We use [pre-commit](https://pre-commit.com/) to automatically check and format code before each commit (using `pyink`, `ruff`, `pylint`, and general git hygiene checks).
+
+> **Important:** Make sure you are in your active virtual environment (e.g. `maxdiffusion_venv` or your active venv) before running `pre-commit install`, so that hooks run using the environment's installed dependencies.
+
+```bash
+# 1. Activate your virtual environment first
+source <path-to-venv>/bin/activate
+
+# 2. Install pre-commit (if not already installed)
+pip install pre-commit
+
+# 3. Install git pre-commit hooks
+pre-commit install
+```
+
+Once installed, pre-commit will automatically run on staged files whenever you run `git commit`.
+
+You can also run all pre-commit checks manually across the entire repository at any time:
+
+```bash
+pre-commit run --all-files
+```
+
+### Code Style
+
 This project uses `pylint` and `pyink` to enforce code style. Before submitting a pull request, please ensure your code passes these checks by running:
 
-```
+```bash
 bash code_style.sh
 ```
 

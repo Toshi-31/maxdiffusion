@@ -66,7 +66,7 @@ after which log out and log back in to the machine.
 
     See details on docker images in xpk here: https://github.com/google/xpk/blob/main/README.md#how-to-add-docker-images-to-a-xpk-workload
 
-    **Note:** When using the XPK command, ensure you include `pip install .` to install the package from the current directory. This is necessary because the container is created from a copy of your local directory, and `pip install .` ensures any local changes you've made are applied within the container. 
+    **Note:** When using the XPK command, ensure you include `pip install .` to install the package from the current directory. This is necessary because the container is created from a copy of your local directory, and `pip install .` ensures any local changes you've made are applied within the container.
 
     __Using xpk to upload image to your gcp project and run MaxDiffusion__
 

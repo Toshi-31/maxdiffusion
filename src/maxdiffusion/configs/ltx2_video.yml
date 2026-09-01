@@ -15,7 +15,7 @@ ulysses_shards: -1
 ulysses_attention_chunks: 1
 a2v_attention_kernel: 'dot_product'
 v2a_attention_kernel: 'dot_product'
-attention_sharding_uniform: True 
+attention_sharding_uniform: True
 precision: 'bf16'
 
 # For scanning transformer layers
@@ -147,16 +147,15 @@ train_split: 'train'
 dataset_type: 'tfrecord'
 cache_latents_text_encoder_outputs: True
 per_device_batch_size: 1.0
-compile_topology_num_slices: -1 
+compile_topology_num_slices: -1
 quantization_local_shard_count: -1
 use_qwix_quantization: False
 weight_quantization_calibration_method: "absmax"
 act_quantization_calibration_method: "absmax"
 bwd_quantization_calibration_method: "absmax"
 qwix_module_path: ".*"
-jit_initializers: True 
+jit_initializers: True
 enable_single_replica_ckpt_restoring: False
-seed: 0
 audio_format: "s16"
 
 # LoRA parameters

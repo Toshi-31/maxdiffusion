@@ -9,7 +9,7 @@ should probably proofread and complete it, then remove this comment. -->
 
 ## Model description
 
-This diffusion model is trained with the [🤗 Diffusers](https://github.com/huggingface/diffusers) library 
+This diffusion model is trained with the [🤗 Diffusers](https://github.com/huggingface/diffusers) library
 on the `{{ dataset_name }}` dataset.
 
 ## Intended uses & limitations
@@ -46,5 +46,3 @@ The following hyperparameters were used during training:
 ### Training results
 
 📈 [TensorBoard logs](https://huggingface.co/{{ repo_name }}/tensorboard?#scalars)
-
-

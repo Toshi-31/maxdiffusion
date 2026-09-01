@@ -160,7 +160,8 @@ debug.env
 tags
 
 # pre-commit
-.pre-commit*
+.pre-commit-cache/
+!.pre-commit-config.yaml
 
 # .lock
 *.lock

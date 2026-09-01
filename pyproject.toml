@@ -67,9 +67,9 @@ test = [
 torch = ["torch", "accelerate"]
 flax = ["jax", "jaxlib", "flax"]
 dev = [
-    "urllib3", "black", "isort", "ruff", "hf-doc-builder", "compel", "datasets", "Jinja2", 
-    "invisible-watermark", "k-diffusion", "librosa", "omegaconf", "parameterized", "pytest", 
-    "pytest-timeout", "pytest-xdist", "requests-mock", "safetensors", "sentencepiece", "scipy", 
+    "urllib3", "black", "isort", "ruff", "hf-doc-builder", "compel", "datasets", "Jinja2",
+    "invisible-watermark", "k-diffusion", "librosa", "omegaconf", "parameterized", "pytest",
+    "pytest-timeout", "pytest-xdist", "requests-mock", "safetensors", "sentencepiece", "scipy",
     "torchvision", "accelerate", "protobuf", "tensorboard", "torch", "jax", "jaxlib", "flax"
 ]
 

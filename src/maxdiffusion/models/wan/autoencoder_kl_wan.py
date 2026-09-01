@@ -201,13 +201,19 @@ class WanUpsample(nnx.Module):
     n, h, w, c = in_shape
     target_h = int(h * self.scale_factor[0])
     target_w = int(w * self.scale_factor[1])
-    if self.method == "nearest" and self.scale_factor[0] == int(self.scale_factor[0]) and self.scale_factor[1] == int(self.scale_factor[1]):
+    if (
+        self.method == "nearest"
+        and self.scale_factor[0] == int(self.scale_factor[0])
+        and self.scale_factor[1] == int(self.scale_factor[1])
+    ):
       scale_h = int(self.scale_factor[0])
       scale_w = int(self.scale_factor[1])
       out = jnp.repeat(jnp.repeat(x, scale_h, axis=1), scale_w, axis=2)
     else:
       if self.method == "nearest":
-        max_logging.log(f"Warning: WanUpsample2D nearest method requested but scale_factor {self.scale_factor} is not integer. Falling back to jax.image.resize.")
+        max_logging.log(
+            f"Warning: WanUpsample2D nearest method requested but scale_factor {self.scale_factor} is not integer. Falling back to jax.image.resize."
+        )
       out = jax.image.resize(x.astype(jnp.float32), (n, target_h, target_w, c), method=self.method)
       out = out.astype(input_dtype)
     return out
@@ -1234,7 +1240,10 @@ class AutoencoderKLWan(nnx.Module, FlaxModelMixin, ConfigMixin):
       if spatial_sharding is not None:
         out_chunk = jax.lax.with_sharding_constraint(out_chunk, spatial_sharding)
       next_feat_map = jax.tree_util.tree_map(
-          lambda x: jax.lax.with_sharding_constraint(x, spatial_sharding) if spatial_sharding is not None and hasattr(x, "shape") and x.ndim == len(spatial_sharding.spec) else x, next_feat_map
+          lambda x: jax.lax.with_sharding_constraint(x, spatial_sharding)
+          if spatial_sharding is not None and hasattr(x, "shape") and x.ndim == len(spatial_sharding.spec)
+          else x,
+          next_feat_map,
       )
       return next_feat_map, out_chunk
 
@@ -1333,7 +1342,9 @@ class AutoencoderKLWan(nnx.Module, FlaxModelMixin, ConfigMixin):
           if spatial_sharding is not None:
             out_chunk = jax.lax.with_sharding_constraint(out_chunk, spatial_sharding)
           next_feat_map = jax.tree_util.tree_map(
-              lambda x: jax.lax.with_sharding_constraint(x, spatial_sharding) if spatial_sharding is not None and hasattr(x, "shape") and x.ndim == len(spatial_sharding.spec) else x,
+              lambda x: jax.lax.with_sharding_constraint(x, spatial_sharding)
+              if spatial_sharding is not None and hasattr(x, "shape") and x.ndim == len(spatial_sharding.spec)
+              else x,
               next_feat_map,
           )
           return next_feat_map, out_chunk
