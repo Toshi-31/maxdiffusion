@@ -18,7 +18,7 @@ import json
 import jax
 from typing import Optional, Tuple
 from ..pipelines.wan.wan_pipeline_2_2 import WanPipeline2_2
-from .. import max_logging
+from .. import max_logging, max_utils
 import orbax.checkpoint as ocp
 from maxdiffusion.checkpointing.checkpointing_utils import add_sharding_to_struct, get_cpu_mesh_and_sharding
 from maxdiffusion.checkpointing.wan_checkpointer import WanCheckpointer
@@ -26,6 +26,15 @@ from maxdiffusion.checkpointing.wan_checkpointer import WanCheckpointer
 
 class WanCheckpointer2_2(WanCheckpointer[WanPipeline2_2]):
   pipeline_class = WanPipeline2_2
+
+  def _create_optimizer(self, model, config, learning_rate, scale_factor: float = 1.0):
+    total_steps = max(1, int(config.max_train_steps * scale_factor))
+    schedule_steps = max(1, int(config.learning_rate_schedule_steps * scale_factor))
+    learning_rate_scheduler = max_utils.create_learning_rate_schedule(
+        learning_rate, schedule_steps, config.warmup_steps_fraction, total_steps
+    )
+    tx = max_utils.create_optimizer(config, learning_rate_scheduler)
+    return tx, learning_rate_scheduler
 
   def load_wan_configs_from_orbax(self, step: Optional[int]) -> Tuple[Optional[dict], Optional[int]]:
     if step is None:
@@ -81,11 +90,20 @@ class WanCheckpointer2_2(WanCheckpointer[WanPipeline2_2]):
     return restored_checkpoint, step
 
   def _extract_opt_state(self, restored_checkpoint):
-    if "opt_state" in restored_checkpoint.low_noise_transformer_state.keys():
-      return restored_checkpoint.low_noise_transformer_state["opt_state"]
-    elif "opt_state" in restored_checkpoint.high_noise_transformer_state.keys():
-      return restored_checkpoint.high_noise_transformer_state["opt_state"]
-    return None
+    low_state = getattr(restored_checkpoint, "low_noise_transformer_state", {})
+    high_state = getattr(restored_checkpoint, "high_noise_transformer_state", {})
+    low_opt = low_state.get("opt_state") if isinstance(low_state, dict) else getattr(low_state, "opt_state", None)
+    high_opt = high_state.get("opt_state") if isinstance(high_state, dict) else getattr(high_state, "opt_state", None)
+    low_step = low_state.get("step") if isinstance(low_state, dict) else getattr(low_state, "step", None)
+    high_step = high_state.get("step") if isinstance(high_state, dict) else getattr(high_state, "step", None)
+    if low_opt is None and high_opt is None:
+      return None
+    return {
+        "low_noise_transformer": low_opt,
+        "high_noise_transformer": high_opt,
+        "low_noise_step": low_step,
+        "high_noise_step": high_step,
+    }
 
   def save_checkpoint(self, train_step, pipeline: WanPipeline2_2, train_states: dict):
     """Saves the training state and model configurations."""

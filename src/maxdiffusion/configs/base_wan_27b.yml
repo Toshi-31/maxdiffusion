@@ -409,6 +409,9 @@ num_inference_steps: 40
 fps: 16
 save_final_checkpoint: False
 
+# Location to download pretrained weights
+checkpoint_save_location: "/tmp"
+
 # SDXL Lightning parameters
 lightning_from_pt: True
 # Empty or "ByteDance/SDXL-Lightning" to enable lightning.
